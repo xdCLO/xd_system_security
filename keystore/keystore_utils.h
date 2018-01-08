@@ -17,20 +17,15 @@
 #ifndef KEYSTORE_KEYSTORE_UTILS_H_
 #define KEYSTORE_KEYSTORE_UTILS_H_
 
-#include <stdint.h>
-
+#include <cstdint>
 #include <vector>
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 
-#include <hardware/keymaster_defs.h>
-
 #include <memory>
 
-#include <keystore/authorization_set.h>
-
-#include "blob.h"
+#include <keystore/keymaster_types.h>
 
 size_t readFully(int fd, uint8_t* data, size_t size);
 size_t writeFully(int fd, uint8_t* data, size_t size);
@@ -59,14 +54,15 @@ struct PKCS8_PRIV_KEY_INFO_Delete {
 };
 typedef std::unique_ptr<PKCS8_PRIV_KEY_INFO, PKCS8_PRIV_KEY_INFO_Delete> Unique_PKCS8_PRIV_KEY_INFO;
 
+class Blob;
+
 namespace keystore {
 
-inline static hidl_vec<uint8_t> blob2hidlVec(const Blob& blob) {
-    hidl_vec<uint8_t> result;
-    result.setToExternal(const_cast<uint8_t*>(blob.getValue()), blob.getLength());
-    return result;
-}
+hidl_vec<uint8_t> blob2hidlVec(const Blob& blob);
 
-} // namespace keystore
+SecurityLevel flagsToSecurityLevel(int32_t flags);
+uint32_t securityLevelToFlags(SecurityLevel secLevel);
+
+}  // namespace keystore
 
 #endif  // KEYSTORE_KEYSTORE_UTILS_H_

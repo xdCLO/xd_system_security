@@ -26,6 +26,7 @@ enum State {
     STATE_UNINITIALIZED = 3,
 };
 
+// must be in sync with KeyStore.java,
 enum class ResponseCode: int32_t {
     NO_ERROR          =  STATE_NO_ERROR, // 1
     LOCKED            =  STATE_LOCKED, // 2
@@ -62,6 +63,7 @@ enum KeyStoreFlag : uint8_t {
     // encrypted, and it will be stored separately under an unique UID instead. This flag should
     // only be available to system uid.
     KEYSTORE_FLAG_CRITICAL_TO_DEVICE_ENCRYPTION = 1 << 3,
+    KEYSTORE_FLAG_STRONGBOX = 1 << 4,
 };
 
 #endif

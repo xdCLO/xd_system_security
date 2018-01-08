@@ -25,9 +25,10 @@
 #include <cutils/log.h>
 #include <private/android_filesystem_config.h>
 
-#include <keystore/authorization_set.h>
+#include <keystore/keymaster_types.h>
 #include <keystore/keystore_client.h>
-#include <keystore/IKeystoreService.h>
+
+#include "blob.h"
 
 size_t readFully(int fd, uint8_t* data, size_t size) {
     size_t remaining = size;
@@ -80,7 +81,6 @@ void add_legacy_key_authorizations(int keyType, keystore::AuthorizationSet* para
     params->push_back(TAG_DIGEST, Digest::SHA_2_256);
     params->push_back(TAG_DIGEST, Digest::SHA_2_384);
     params->push_back(TAG_DIGEST, Digest::SHA_2_512);
-    params->push_back(TAG_ALL_USERS);
     params->push_back(TAG_NO_AUTH_REQUIRED);
     params->push_back(TAG_ORIGINATION_EXPIRE_DATETIME, LLONG_MAX);
     params->push_back(TAG_USAGE_EXPIRE_DATETIME, LLONG_MAX);
@@ -94,3 +94,37 @@ uid_t get_app_id(uid_t uid) {
 uid_t get_user_id(uid_t uid) {
     return uid / AID_USER;
 }
+
+namespace keystore {
+
+hidl_vec<uint8_t> blob2hidlVec(const Blob& blob) {
+    hidl_vec<uint8_t> result;
+    result.setToExternal(const_cast<uint8_t*>(blob.getValue()), blob.getLength());
+    return result;
+}
+
+SecurityLevel flagsToSecurityLevel(int32_t flags) {
+    switch (flags & (KEYSTORE_FLAG_FALLBACK | KEYSTORE_FLAG_STRONGBOX)) {
+    case KEYSTORE_FLAG_FALLBACK:
+    // treating Strongbox flag as "don't care" if Fallback is set
+    case (KEYSTORE_FLAG_FALLBACK | KEYSTORE_FLAG_STRONGBOX):
+        return SecurityLevel::SOFTWARE;
+    case KEYSTORE_FLAG_STRONGBOX:
+        return SecurityLevel::STRONGBOX;
+    default:
+        return SecurityLevel::TRUSTED_ENVIRONMENT;
+    }
+}
+
+uint32_t securityLevelToFlags(SecurityLevel secLevel) {
+    switch (secLevel) {
+    case SecurityLevel::SOFTWARE:
+        return KEYSTORE_FLAG_FALLBACK;
+    case SecurityLevel::STRONGBOX:
+        return KEYSTORE_FLAG_STRONGBOX;
+    default:
+        return 0;
+    }
+}
+
+}  // namespace keystore
