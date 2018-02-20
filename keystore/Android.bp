@@ -84,6 +84,7 @@ cc_binary {
     srcs: ["keystore_cli.cpp"],
     shared_libs: [
         "android.hardware.keymaster@3.0",
+        "android.hardware.keymaster@4.0",
         "libbinder",
         "libcrypto",
         "libcutils",
@@ -109,8 +110,8 @@ cc_binary {
     srcs: ["keystore_cli_v2.cpp"],
     shared_libs: [
         "android.hardware.confirmationui@1.0",
-        "android.hardware.keymaster@3.0",
         "libbinder",
+        "android.hardware.keymaster@4.0",
         "libchrome",
         "libutils",
         "libhidlbase",
@@ -244,6 +245,41 @@ cc_library_static {
     ],
 
     export_include_dirs: ["include"],
+}
+
+filegroup {
+    name: "keystore_aidl",
+    srcs: [
+        "binder/android/security/IConfirmationPromptCallback.aidl",
+        "binder/android/security/IKeystoreService.aidl",
+    ],
+}
+
+cc_library_shared {
+    name: "libkeystore_aidl",
+    srcs: [":keystore_aidl"],
+    aidl: {
+        export_aidl_headers: true,
+        include_dirs: [
+            "system/security/keystore/binder",
+        ],
+    },
+    shared_libs: [
+        "libbinder",
+        "libcutils",
+        "libhardware",
+        "libhidlbase",
+        "libhidltransport",
+        "libhwbinder",
+        "libkeystore_parcelables",
+        "liblog",
+        "libselinux",
+        "libutils",
+    ],
+    export_shared_lib_headers: [
+        "libbinder",
+        "libkeystore_parcelables",
+    ],
 }
 
 subdirs = ["tests"]
