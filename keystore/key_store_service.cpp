@@ -69,8 +69,6 @@ using ::android::security::keystore::KeystoreResponse;
 
 constexpr double kIdRotationPeriod = 30 * 24 * 60 * 60; /* Thirty days, in seconds */
 const char* kTimestampFilePath = "timestamp";
-const int ID_ATTESTATION_REQUEST_GENERIC_INFO = 1 << 0;
-const int ID_ATTESTATION_REQUEST_UNIQUE_DEVICE_ID = 1 << 1;
 
 struct BIGNUM_Delete {
     void operator()(BIGNUM* p) const { BN_free(p); }
@@ -256,10 +254,10 @@ Status KeyStoreService::list(const String16& prefix, int32_t targetUid,
 
     ResponseCode rc;
     std::list<LockedKeyBlobEntry> internal_matches;
+    auto userDirName = mKeyStore->getUserStateDB().getUserStateByUid(targetUid)->getUserDirName();
 
-    std::tie(rc, internal_matches) = LockedKeyBlobEntry::list(
-        mKeyStore->getUserStateDB().getUserStateByUid(targetUid)->getUserDirName(),
-        [&](uid_t uid, const std::string& alias) {
+    std::tie(rc, internal_matches) =
+        LockedKeyBlobEntry::list(userDirName, [&](uid_t uid, const std::string& alias) {
             std::mismatch(stdPrefix.begin(), stdPrefix.end(), alias.begin(), alias.end());
             return uid == static_cast<uid_t>(targetUid) &&
                    std::mismatch(stdPrefix.begin(), stdPrefix.end(), alias.begin(), alias.end())
@@ -582,11 +580,10 @@ Status KeyStoreService::is_hardware_backed(const String16& keyType, int32_t* aid
     return Status::ok();
 }
 
-Status KeyStoreService::clear_uid(int64_t targetUid64, int32_t* aidl_return) {
+Status KeyStoreService::clear_uid(int64_t targetUid64, int32_t* _aidl_return) {
     uid_t targetUid = getEffectiveUid(targetUid64);
     if (!checkBinderPermissionSelfOrSystem(P_CLEAR_UID, targetUid)) {
-        *aidl_return = static_cast<int32_t>(ResponseCode::PERMISSION_DENIED);
-        return Status::ok();
+        return AIDL_RETURN(ResponseCode::PERMISSION_DENIED);
     }
     ALOGI("clear_uid %" PRId64, targetUid64);
 
@@ -594,16 +591,15 @@ Status KeyStoreService::clear_uid(int64_t targetUid64, int32_t* aidl_return) {
 
     ResponseCode rc;
     std::list<LockedKeyBlobEntry> entries;
+    auto userDirName = mKeyStore->getUserStateDB().getUserStateByUid(targetUid)->getUserDirName();
 
     // list has a fence making sure no workers are modifying blob files before iterating the
     // data base. All returned entries are locked.
     std::tie(rc, entries) = LockedKeyBlobEntry::list(
-        mKeyStore->getUserStateDB().getUserStateByUid(targetUid)->getUserDirName(),
-        [&](uid_t uid, const std::string&) -> bool { return uid == targetUid; });
+        userDirName, [&](uid_t uid, const std::string&) -> bool { return uid == targetUid; });
 
     if (rc != ResponseCode::NO_ERROR) {
-        *aidl_return = static_cast<int32_t>(rc);
-        return Status::ok();
+        return AIDL_RETURN(rc);
     }
 
     for (LockedKeyBlobEntry& lockedEntry : entries) {
@@ -618,8 +614,7 @@ Status KeyStoreService::clear_uid(int64_t targetUid64, int32_t* aidl_return) {
         }
         mKeyStore->del(lockedEntry);
     }
-    *aidl_return = static_cast<int32_t>(ResponseCode::NO_ERROR);
-    return Status::ok();
+    return AIDL_RETURN(ResponseCode::NO_ERROR);
 }
 
 Status KeyStoreService::addRngEntropy(
@@ -821,7 +816,7 @@ Status KeyStoreService::exportKey(
 
     std::tie(rc, keyBlob, charBlob, lockedEntry) =
         mKeyStore->getKeyForName(name8, targetUid, TYPE_KEYMASTER_10);
-    if (!rc) {
+    if (!rc.isOk()) {
         return AIDL_RETURN(rc);
     }
 
@@ -973,9 +968,8 @@ Status KeyStoreService::addAuthToken(const ::std::vector<uint8_t>& authTokenAsVe
     return Status::ok();
 }
 
-int isDeviceIdAttestationRequested(const KeymasterArguments& params) {
+bool isDeviceIdAttestationRequested(const KeymasterArguments& params) {
     const hardware::hidl_vec<KeyParameter>& paramsVec = params.getParameters();
-    int result = 0;
     for (size_t i = 0; i < paramsVec.size(); ++i) {
         switch (paramsVec[i].tag) {
         case Tag::ATTESTATION_ID_BRAND:
@@ -983,18 +977,15 @@ int isDeviceIdAttestationRequested(const KeymasterArguments& params) {
         case Tag::ATTESTATION_ID_MANUFACTURER:
         case Tag::ATTESTATION_ID_MODEL:
         case Tag::ATTESTATION_ID_PRODUCT:
-            result |= ID_ATTESTATION_REQUEST_GENERIC_INFO;
-            break;
         case Tag::ATTESTATION_ID_IMEI:
         case Tag::ATTESTATION_ID_MEID:
         case Tag::ATTESTATION_ID_SERIAL:
-            result |= ID_ATTESTATION_REQUEST_UNIQUE_DEVICE_ID;
-            break;
+            return true;
         default:
             continue;
         }
     }
-    return result;
+    return false;
 }
 
 Status KeyStoreService::attestKey(
@@ -1007,15 +998,7 @@ Status KeyStoreService::attestKey(
 
     uid_t callingUid = IPCThreadState::self()->getCallingUid();
 
-    int needsIdAttestation = isDeviceIdAttestationRequested(params);
-    bool needsUniqueIdAttestation = needsIdAttestation & ID_ATTESTATION_REQUEST_UNIQUE_DEVICE_ID;
-    bool isPrimaryUserSystemUid = (callingUid == AID_SYSTEM);
-    bool isSomeUserSystemUid = (get_app_id(callingUid) == AID_SYSTEM);
-    // Allow system context from any user to request attestation with basic device information,
-    // while only allow system context from user 0 (device owner) to request attestation with
-    // unique device ID.
-    if ((needsIdAttestation && !isSomeUserSystemUid) ||
-        (needsUniqueIdAttestation && !isPrimaryUserSystemUid)) {
+    if (isDeviceIdAttestationRequested(params) && (get_app_id(callingUid) != AID_SYSTEM)) {
         return AIDL_RETURN(KeyStoreServiceReturnCode(ErrorCode::INVALID_ARGUMENT));
     }
 
