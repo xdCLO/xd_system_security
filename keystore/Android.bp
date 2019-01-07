@@ -13,7 +13,6 @@ cc_defaults {
     },
 
     clang: true,
-    cpp_std: "c++17",
 }
 
 cc_binary {
@@ -234,6 +233,7 @@ cc_library_static {
     srcs: [
         ":IKeyAttestationApplicationIdProvider.aidl",
         "auth_token_table.cpp",
+        "blob.cpp",
         "keystore_attestation_id.cpp",
         "KeyAttestationApplicationId.cpp",
         "KeyAttestationPackageInfo.cpp",
