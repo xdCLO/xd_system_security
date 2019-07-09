@@ -19,7 +19,7 @@
 
 #include <cstdint>
 #include <vector>
-
+#include <string>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 
@@ -29,7 +29,8 @@
 
 size_t readFully(int fd, uint8_t* data, size_t size);
 size_t writeFully(int fd, uint8_t* data, size_t size);
-
+std::string getContainingDirectory(const std::string& filename);
+void fsyncDirectory(const std::string& path);
 void add_legacy_key_authorizations(int keyType, keystore::AuthorizationSet* params);
 
 /**

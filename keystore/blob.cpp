@@ -272,6 +272,8 @@ ResponseCode Blob::writeBlob(const std::string& filename, const std::vector<uint
         ALOGW("could not rename blob to %s: %s", filename.c_str(), strerror(errno));
         return ResponseCode::SYSTEM_ERROR;
     }
+
+    fsyncDirectory(getContainingDirectory(filename));
     return ResponseCode::NO_ERROR;
 }
 
