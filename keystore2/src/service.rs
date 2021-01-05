@@ -18,16 +18,20 @@
 //! This crate implement the core Keystore 2.0 service API as defined by the Keystore 2.0
 //! AIDL spec.
 
-use crate::database::{KeyEntryLoadBits, SubComponentType};
 use crate::error::{self, map_or_log_err, ErrorCode};
 use crate::globals::DB;
 use crate::permission;
-use crate::permission::KeyPerm;
+use crate::permission::{KeyPerm, KeystorePerm};
 use crate::security_level::KeystoreSecurityLevel;
 use crate::utils::{
-    check_grant_permission, check_key_permission, key_parameters_to_authorizations, Asp,
+    check_grant_permission, check_key_permission, check_keystore_permission,
+    key_parameters_to_authorizations, Asp,
 };
-use android_hardware_keymint::aidl::android::hardware::keymint::SecurityLevel::SecurityLevel;
+use crate::{
+    database::{KeyEntryLoadBits, KeyType, SubComponentType},
+    error::ResponseCode,
+};
+use android_hardware_security_keymint::aidl::android::hardware::security::keymint::SecurityLevel::SecurityLevel;
 use android_system_keystore2::aidl::android::system::keystore2::{
     Domain::Domain, IKeystoreSecurityLevel::IKeystoreSecurityLevel,
     IKeystoreService::BnKeystoreService, IKeystoreService::IKeystoreService,
@@ -35,6 +39,8 @@ use android_system_keystore2::aidl::android::system::keystore2::{
 };
 use anyhow::{anyhow, Context, Result};
 use binder::{IBinder, Interface, ThreadState};
+use error::Error;
+use keystore2_selinux as selinux;
 
 /// Implementation of the IKeystoreService.
 pub struct KeystoreService {
@@ -74,6 +80,7 @@ impl KeystoreService {
             .with(|db| {
                 db.borrow_mut().load_key_entry(
                     key.clone(),
+                    KeyType::Client,
                     KeyEntryLoadBits::PUBLIC,
                     ThreadState::get_calling_uid(),
                     |k, av| check_key_permission(KeyPerm::get_info(), k, &av),
@@ -100,8 +107,13 @@ impl KeystoreService {
                 keySecurityLevel: key_entry.sec_level(),
                 certificate: key_entry.take_cert(),
                 certificateChain: key_entry.take_cert_chain(),
+                modificationTimeMs: key_entry
+                    .metadata()
+                    .creation_date()
+                    .map(|d| d.to_millis_epoch())
+                    .ok_or(Error::Rc(ResponseCode::VALUE_CORRUPTED))
+                    .context("In get_key_entry: Trying to get creation date.")?,
                 authorizations: key_parameters_to_authorizations(key_entry.into_key_parameters()),
-                ..Default::default()
             },
         })
     }
@@ -117,6 +129,7 @@ impl KeystoreService {
             let (key_id_guard, key_entry) = db
                 .load_key_entry(
                     key.clone(),
+                    KeyType::Client,
                     KeyEntryLoadBits::NONE,
                     ThreadState::get_calling_uid(),
                     |k, av| {
@@ -146,8 +159,44 @@ impl KeystoreService {
     }
 
     fn list_entries(&self, domain: Domain, namespace: i64) -> Result<Vec<KeyDescriptor>> {
-        // TODO implement.
-        Err(anyhow!(error::Error::sys()))
+        let mut k = match domain {
+            Domain::APP => KeyDescriptor {
+                domain,
+                nspace: ThreadState::get_calling_uid() as u64 as i64,
+                ..Default::default()
+            },
+            Domain::SELINUX => KeyDescriptor{domain, nspace: namespace, ..Default::default()},
+            _ => return Err(Error::perm()).context(
+                "In list_entries: List entries is only supported for Domain::APP and Domain::SELINUX."
+            ),
+        };
+
+        // First we check if the caller has the info permission for the selected domain/namespace.
+        // By default we use the calling uid as namespace if domain is Domain::APP.
+        // If the first check fails we check if the caller has the list permission allowing to list
+        // any namespace. In that case we also adjust the queried namespace if a specific uid was
+        // selected.
+        match check_key_permission(KeyPerm::get_info(), &k, &None) {
+            Err(e) => {
+                if let Some(selinux::Error::PermissionDenied) =
+                    e.root_cause().downcast_ref::<selinux::Error>()
+                {
+                    check_keystore_permission(KeystorePerm::list())
+                        .context("In list_entries: While checking keystore permission.")?;
+                    if namespace != -1 {
+                        k.nspace = namespace;
+                    }
+                } else {
+                    return Err(e).context("In list_entries: While checking key permission.")?;
+                }
+            }
+            Ok(()) => {}
+        };
+
+        DB.with(|db| {
+            let mut db = db.borrow_mut();
+            db.list(k.domain, k.nspace)
+        })
     }
 
     fn delete_key(&self, key: &KeyDescriptor) -> Result<()> {

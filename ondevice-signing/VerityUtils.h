@@ -14,24 +14,12 @@
  * limitations under the License.
  */
 
-package android.security;
+#pragma once
 
-import android.security.ByteArray;
-import android.hardware.keymint.KeyParameter;
+#include <android-base/result.h>
 
-/**
- * Internal interface for performing device attestation.
- *
- * @hide
- */
-interface IAttestationManager {
-    /**
-     * Attest a provided list of device identifiers.
-     *
-     * @return The signed certificate chain, with each individual certificate encoded as a byte
-     *         array.
-     */
-    ByteArray[] attestDevice(
-            in KeyParameter[] deviceIdentifiers, boolean useIndividualAttestation,
-            in byte[] attestationChallenge, int securityLevel);
-}
+#include "KeymasterSigningKey.h"
+
+android::base::Result<void> verifyAllFilesInVerity(const std::string& path);
+android::base::Result<void> addFilesToVerityRecursive(const std::string& path,
+                                                      const KeymasterSigningKey& key);
