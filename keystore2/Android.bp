@@ -19,11 +19,13 @@ rust_library {
 
     rustlibs: [
         "android.system.keystore2-rust",
-        "android.hardware.keymint-rust",
+        "android.hardware.security.keymint-rust",
         "libanyhow",
         "libbinder_rs",
+        "libkeystore2_crypto_rust",
         "libkeystore2_selinux",
         "liblazy_static",
+        "liblibc",
         "liblibsqlite3_sys",
         "liblog_rust",
         "librand",
@@ -41,14 +43,17 @@ rust_test {
     test_config: "AndroidTest.xml",
     rustlibs: [
         "android.system.keystore2-rust",
-        "android.hardware.keymint-rust",
+        "android.hardware.security.keymint-rust",
         "libandroid_logger",
         "libanyhow",
         "libbinder_rs",
+        "libkeystore2_crypto_rust",
         "libkeystore2_selinux",
         "liblazy_static",
+        "liblibc",
         "liblibsqlite3_sys",
         "liblog_rust",
+        "librand",
         "librusqlite",
         "libthiserror",
     ],
@@ -64,23 +69,4 @@ rust_binary {
         "liblog_rust",
     ],
     init_rc: ["keystore2.rc"],
-}
-
-aidl_interface {
-    name: "android.security.attestationmanager",
-    srcs: [
-        "aidl/android/security/ByteArray.aidl",
-        "aidl/android/security/IAttestationManager.aidl",
-    ],
-    local_include_dir: "aidl",
-    imports: [ "android.hardware.keymint" ],
-    unstable: true,
-    backend: {
-        java: {
-            sdk_version: "module_current",
-        },
-        rust: {
-            enabled: true,
-        },
-    },
 }
