@@ -17,6 +17,8 @@
 //! to talk to.
 
 use crate::database::KeystoreDB;
+use crate::super_key::SuperKeyManager;
+use lazy_static::lazy_static;
 use std::cell::RefCell;
 
 thread_local! {
@@ -25,5 +27,17 @@ thread_local! {
     /// used by only one thread. So we store one database connection per
     /// thread in this thread local key.
     pub static DB: RefCell<KeystoreDB> =
-            RefCell::new(KeystoreDB::new().expect("Failed to open database."));
+            RefCell::new(
+                KeystoreDB::new(
+                    // Keystore changes to the database directory on startup
+                    // (see keystor2_main.rs).
+                    &std::env::current_dir()
+                    .expect("Could not get the current working directory.")
+                )
+                .expect("Failed to open database."));
+}
+
+lazy_static! {
+    /// Runtime database of unwrapped super keys.
+    pub static ref SUPER_KEY: SuperKeyManager = Default::default();
 }
