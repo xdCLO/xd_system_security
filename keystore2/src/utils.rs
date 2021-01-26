@@ -12,10 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This suppresses the compiler's complaint about converting tv_sec to i64 in method
-// get_current_time_in_seconds.
-#![allow(clippy::useless_conversion)]
-
 //! This module implements utility functions used by the Keystore 2.0 service
 //! implementation.
 
@@ -23,13 +19,22 @@ use crate::error::Error;
 use crate::permission;
 use crate::permission::{KeyPerm, KeyPermSet, KeystorePerm};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    KeyCharacteristics::KeyCharacteristics, SecurityLevel::SecurityLevel,
+    KeyCharacteristics::KeyCharacteristics, SecurityLevel::SecurityLevel, Tag::Tag,
+};
+use android_security_apc::aidl::android::security::apc::{
+    IProtectedConfirmation::{FLAG_UI_OPTION_INVERTED, FLAG_UI_OPTION_MAGNIFIED},
+    ResponseCode::ResponseCode as ApcResponseCode,
 };
 use android_system_keystore2::aidl::android::system::keystore2::{
     Authorization::Authorization, KeyDescriptor::KeyDescriptor,
 };
 use anyhow::{anyhow, Context};
 use binder::{FromIBinder, SpIBinder, ThreadState};
+use keystore2_apc_compat::{
+    ApcCompatUiOptions, APC_COMPAT_ERROR_ABORTED, APC_COMPAT_ERROR_CANCELLED,
+    APC_COMPAT_ERROR_IGNORED, APC_COMPAT_ERROR_OK, APC_COMPAT_ERROR_OPERATION_PENDING,
+    APC_COMPAT_ERROR_SYSTEM_ERROR,
+};
 use std::convert::TryFrom;
 use std::sync::Mutex;
 
@@ -108,21 +113,30 @@ impl Asp {
     }
 }
 
+impl Clone for Asp {
+    fn clone(&self) -> Self {
+        let lock = self.0.lock().unwrap();
+        Self(Mutex::new((*lock).clone()))
+    }
+}
+
 /// Converts a set of key characteristics as returned from KeyMint into the internal
 /// representation of the keystore service.
-/// The parameter `hw_security_level` indicates which security level shall be used for
-/// parameters found in the hardware enforced parameter list.
 pub fn key_characteristics_to_internal(
-    key_characteristics: KeyCharacteristics,
-    hw_security_level: SecurityLevel,
+    key_characteristics: Vec<KeyCharacteristics>,
 ) -> Vec<crate::key_parameter::KeyParameter> {
     key_characteristics
-        .hardwareEnforced
         .into_iter()
-        .map(|aidl_kp| crate::key_parameter::KeyParameter::new(aidl_kp.into(), hw_security_level))
-        .chain(key_characteristics.softwareEnforced.into_iter().map(|aidl_kp| {
-            crate::key_parameter::KeyParameter::new(aidl_kp.into(), SecurityLevel::SOFTWARE)
-        }))
+        .flat_map(|aidl_key_char| {
+            let sec_level = aidl_key_char.securityLevel;
+            aidl_key_char.authorizations.into_iter().map(move |aidl_kp| {
+                let sec_level = match (aidl_kp.tag, sec_level) {
+                    (Tag::ORIGIN, SecurityLevel::SOFTWARE) => SecurityLevel::TRUSTED_ENVIRONMENT,
+                    _ => sec_level,
+                };
+                crate::key_parameter::KeyParameter::new(aidl_kp.into(), sec_level)
+            })
+        })
         .collect()
 }
 
@@ -143,7 +157,35 @@ pub fn get_current_time_in_seconds() -> i64 {
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut current_time) };
     // It is safe to unwrap here because try_from() returns std::convert::Infallible, which is
     // defined to be an error that can never happen (i.e. the result is always ok).
+    // This suppresses the compiler's complaint about converting tv_sec to i64 in method
+    // get_current_time_in_seconds.
+    #[allow(clippy::useless_conversion)]
     i64::try_from(current_time.tv_sec).unwrap()
+}
+
+/// Converts a response code as returned by the Android Protected Confirmation HIDL compatibility
+/// module (keystore2_apc_compat) into a ResponseCode as defined by the APC AIDL
+/// (android.security.apc) spec.
+pub fn compat_2_response_code(rc: u32) -> ApcResponseCode {
+    match rc {
+        APC_COMPAT_ERROR_OK => ApcResponseCode::OK,
+        APC_COMPAT_ERROR_CANCELLED => ApcResponseCode::CANCELLED,
+        APC_COMPAT_ERROR_ABORTED => ApcResponseCode::ABORTED,
+        APC_COMPAT_ERROR_OPERATION_PENDING => ApcResponseCode::OPERATION_PENDING,
+        APC_COMPAT_ERROR_IGNORED => ApcResponseCode::IGNORED,
+        APC_COMPAT_ERROR_SYSTEM_ERROR => ApcResponseCode::SYSTEM_ERROR,
+        _ => ApcResponseCode::SYSTEM_ERROR,
+    }
+}
+
+/// Converts the UI Options flags as defined by the APC AIDL (android.security.apc) spec into
+/// UI Options flags as defined by the Android Protected Confirmation HIDL compatibility
+/// module (keystore2_apc_compat).
+pub fn ui_opts_2_compat(opt: i32) -> ApcCompatUiOptions {
+    ApcCompatUiOptions {
+        inverted: (opt & FLAG_UI_OPTION_INVERTED) != 0,
+        magnified: (opt & FLAG_UI_OPTION_MAGNIFIED) != 0,
+    }
 }
 
 /// AID offset for uid space partitioning.
