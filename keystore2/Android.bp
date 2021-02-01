@@ -19,7 +19,7 @@ rust_library {
 
     rustlibs: [
         "android.system.keystore2-rust",
-        "libandroid_hardware_keymint",
+        "android.hardware.keymint-rust",
         "libanyhow",
         "libbinder_rs",
         "libkeystore2_selinux",
@@ -36,15 +36,15 @@ rust_test {
     name: "keystore2_test",
     crate_name: "keystore2",
     srcs: ["src/lib.rs"],
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
+    test_suites: ["device-tests"],
+    auto_gen_config: false,
+    test_config: "AndroidTest.xml",
     rustlibs: [
         "android.system.keystore2-rust",
+        "android.hardware.keymint-rust",
         "libandroid_logger",
-        "libandroid_hardware_keymint",
         "libanyhow",
         "libbinder_rs",
-        "libkeystore2_crypto_bindgen",
         "libkeystore2_selinux",
         "liblazy_static",
         "liblibsqlite3_sys",
@@ -52,24 +52,6 @@ rust_test {
         "librusqlite",
         "libthiserror",
     ],
-    shared_libs: ["libkeystore2_crypto"],
-}
-
-cc_library {
-    name: "libkeystore2_crypto",
-    srcs: ["src/crypto.cpp"],
-    shared_libs: [
-        "libcrypto",
-        "liblog",
-    ],
-}
-
-rust_bindgen {
-    name: "libkeystore2_crypto_bindgen",
-    wrapper_src: "src/crypto.hpp",
-    crate_name: "keystore2_crypto_bindgen",
-    source_stem: "bindings",
-    host_supported: true,
 }
 
 rust_binary {
@@ -84,16 +66,21 @@ rust_binary {
     init_rc: ["keystore2.rc"],
 }
 
-// This is a placeholder for the libraries that will be generated from the AIDL specs
-// eventually.
-rust_library {
-    name: "libandroid_hardware_keymint",
-    crate_name: "android_hardware_keymint",
-
-    srcs: ["src/android_hardware_keymint.rs"],
-
-    rustlibs: [
-        "libbinder_rs",
-        "liblazy_static",
+aidl_interface {
+    name: "android.security.attestationmanager",
+    srcs: [
+        "aidl/android/security/ByteArray.aidl",
+        "aidl/android/security/IAttestationManager.aidl",
     ],
+    local_include_dir: "aidl",
+    imports: [ "android.hardware.keymint" ],
+    unstable: true,
+    backend: {
+        java: {
+            sdk_version: "module_current",
+        },
+        rust: {
+            enabled: true,
+        },
+    },
 }
