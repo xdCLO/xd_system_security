@@ -16,9 +16,7 @@
 #![recursion_limit = "256"]
 
 pub mod apc;
-pub mod auth_token_handler;
 pub mod authorization;
-pub mod background_task_handler;
 pub mod database;
 pub mod enforcements;
 pub mod error;
@@ -28,6 +26,7 @@ pub mod key_parameter;
 pub mod legacy_blob;
 pub mod operation;
 pub mod permission;
+pub mod remote_provisioning;
 pub mod security_level;
 pub mod service;
 pub mod utils;
@@ -36,8 +35,3 @@ mod async_task;
 mod db_utils;
 mod gc;
 mod super_key;
-
-#[cfg(test)]
-mod test {
-    pub mod utils;
-}

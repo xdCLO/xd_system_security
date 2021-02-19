@@ -17,12 +17,9 @@
 use binder::Interface;
 use keystore2::apc::ApcManager;
 use keystore2::authorization::AuthorizationManager;
-use keystore2::background_task_handler::Message;
-use keystore2::globals::{BACKGROUND_TASK_HANDLER, ENFORCEMENTS};
 use keystore2::service::KeystoreService;
 use log::{error, info};
-use std::panic;
-use std::sync::mpsc::channel;
+use std::{panic, path::Path};
 
 static KS2_SERVICE_NAME: &str = "android.system.keystore2";
 static APC_SERVICE_NAME: &str = "android.security.apc";
@@ -42,26 +39,23 @@ fn main() {
     // Saying hi.
     info!("Keystore2 is starting.");
 
+    // Initialize the per boot database.
+    let _keep_me_alive = keystore2::database::KeystoreDB::keep_perboot_db_alive()
+        .expect("Failed to initialize the perboot database.");
+
     let mut args = std::env::args();
     args.next().expect("That's odd. How is there not even a first argument?");
 
-    // Keystore changes to the database directory on startup (typically /data/misc/keystore).
+    // Keystore 2.0 cannot change to the database directory (typically /data/misc/keystore) on
+    // startup as Keystore 1.0 did because Keystore 2.0 is intended to run much earlier than
+    // Keystore 1.0. Instead we set a global variable to the database path.
     // For the ground truth check the service startup rule for init (typically in keystore2.rc).
     if let Some(dir) = args.next() {
-        if std::env::set_current_dir(dir.clone()).is_err() {
-            panic!("Failed to set working directory {}.", dir)
-        }
+        *keystore2::globals::DB_PATH.lock().expect("Could not lock DB_PATH.") =
+            Path::new(&dir).to_path_buf();
     } else {
         panic!("Must specify a working directory.");
     }
-
-    // initialize the channel via which the enforcement module and background task handler module
-    // communicate, and hand over the sender and receiver ends to the respective objects.
-    let (sender, receiver) = channel::<Message>();
-    ENFORCEMENTS.set_sender_to_bth(sender);
-    BACKGROUND_TASK_HANDLER.start_bth(receiver).unwrap_or_else(|e| {
-        panic!("Failed to start background task handler because of {:?}.", e);
-    });
 
     info!("Starting thread pool now.");
     binder::ProcessState::start_thread_pool();
