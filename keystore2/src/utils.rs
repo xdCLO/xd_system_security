@@ -19,7 +19,7 @@ use crate::error::Error;
 use crate::permission;
 use crate::permission::{KeyPerm, KeyPermSet, KeystorePerm};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    KeyCharacteristics::KeyCharacteristics, SecurityLevel::SecurityLevel, Tag::Tag,
+    KeyCharacteristics::KeyCharacteristics,
 };
 use android_security_apc::aidl::android::security::apc::{
     IProtectedConfirmation::{FLAG_UI_OPTION_INVERTED, FLAG_UI_OPTION_MAGNIFIED},
@@ -77,6 +77,7 @@ pub fn check_key_permission(
 ) -> anyhow::Result<()> {
     ThreadState::with_calling_sid(|calling_sid| {
         permission::check_key_permission(
+            ThreadState::get_calling_uid(),
             &calling_sid
                 .ok_or_else(Error::sys)
                 .context("In check_key_permission: Cannot check permission without calling_sid.")?,
@@ -130,10 +131,6 @@ pub fn key_characteristics_to_internal(
         .flat_map(|aidl_key_char| {
             let sec_level = aidl_key_char.securityLevel;
             aidl_key_char.authorizations.into_iter().map(move |aidl_kp| {
-                let sec_level = match (aidl_kp.tag, sec_level) {
-                    (Tag::ORIGIN, SecurityLevel::SOFTWARE) => SecurityLevel::TRUSTED_ENVIRONMENT,
-                    _ => sec_level,
-                };
                 crate::key_parameter::KeyParameter::new(aidl_kp.into(), sec_level)
             })
         })
