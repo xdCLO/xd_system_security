@@ -67,6 +67,7 @@ cc_library {
         "libcrypto",
         "libhidlbase",
         "libkeymaster4_1support",
+        "libkeymint",
         "libkeymint_support",
         "libkeystore2_crypto",
         "libutils",
@@ -119,6 +120,7 @@ cc_test {
         "libkeymint_support",
         "libkeystore2_crypto",
         "libkm_compat",
+        "libkm_compat_service",
         "libutils",
     ],
 }

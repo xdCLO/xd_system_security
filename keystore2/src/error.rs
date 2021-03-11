@@ -57,6 +57,10 @@ pub enum Error {
     /// Wraps a Binder status code.
     #[error("Binder transaction error {0:?}")]
     BinderTransaction(StatusCode),
+    /// Wraps a Remote Provisioning ErrorCode as defined by the IRemotelyProvisionedComponent
+    /// AIDL interface spec.
+    #[error("Error::Rp({0:?})")]
+    Rp(ErrorCode),
 }
 
 impl Error {
@@ -98,6 +102,16 @@ pub fn map_km_error<T>(r: BinderResult<T>) -> Result<T, Error> {
             // `map_or_log_err` will map this on a system error.
             e_code => Error::Binder(e_code, 0),
         }
+    })
+}
+
+/// Helper function to map the binder status we get from calls into a RemotelyProvisionedComponent
+/// to a Keystore Error. We don't create an anyhow error here to make
+/// it easier to evaluate service specific errors.
+pub fn map_rem_prov_error<T>(r: BinderResult<T>) -> Result<T, Error> {
+    r.map_err(|s| match s.exception_code() {
+        ExceptionCode::SERVICE_SPECIFIC => Error::Rp(ErrorCode(s.service_specific_error())),
+        e_code => Error::Binder(e_code, 0),
     })
 }
 
@@ -157,13 +171,36 @@ pub fn map_or_log_err<T, U, F>(result: anyhow::Result<U>, handle_ok: F) -> Binde
 where
     F: FnOnce(U) -> BinderResult<T>,
 {
-    result.map_or_else(
+    map_err_with(
+        result,
         |e| {
             log::error!("{:?}", e);
+            e
+        },
+        handle_ok,
+    )
+}
+
+/// This function behaves similar to map_or_log_error, but it does not log the errors, instead
+/// it calls map_err on the error before mapping it to a binder result allowing callers to
+/// log or transform the error before mapping it.
+pub fn map_err_with<T, U, F1, F2>(
+    result: anyhow::Result<U>,
+    map_err: F1,
+    handle_ok: F2,
+) -> BinderResult<T>
+where
+    F1: FnOnce(anyhow::Error) -> anyhow::Error,
+    F2: FnOnce(U) -> BinderResult<T>,
+{
+    result.map_or_else(
+        |e| {
+            let e = map_err(e);
             let root_cause = e.root_cause();
             let rc = match root_cause.downcast_ref::<Error>() {
                 Some(Error::Rc(rcode)) => rcode.0,
                 Some(Error::Km(ec)) => ec.0,
+                Some(Error::Rp(_)) => ResponseCode::SYSTEM_ERROR.0,
                 // If an Error::Binder reaches this stage we report a system error.
                 // The exception code and possible service specific error will be
                 // printed in the error log above.
