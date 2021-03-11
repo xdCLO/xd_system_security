@@ -20,21 +20,21 @@
 
 use std::collections::HashMap;
 
+use crate::error::{self, map_or_log_err, ErrorCode};
 use crate::permission::{KeyPerm, KeystorePerm};
 use crate::security_level::KeystoreSecurityLevel;
 use crate::utils::{
     check_grant_permission, check_key_permission, check_keystore_permission,
     key_parameters_to_authorizations, Asp,
 };
-use crate::{database::Uuid, globals::DB};
+use crate::{
+    database::Uuid,
+    globals::{create_thread_local_db, DB, LEGACY_BLOB_LOADER, LEGACY_MIGRATOR},
+};
 use crate::{database::KEYSTORE_UUID, permission};
 use crate::{
     database::{KeyEntryLoadBits, KeyType, SubComponentType},
     error::ResponseCode,
-};
-use crate::{
-    error::{self, map_or_log_err, ErrorCode},
-    gc::Gc,
 };
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::SecurityLevel::SecurityLevel;
 use android_system_keystore2::aidl::android::system::keystore2::{
@@ -43,7 +43,7 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     KeyDescriptor::KeyDescriptor, KeyEntryResponse::KeyEntryResponse, KeyMetadata::KeyMetadata,
 };
 use anyhow::{Context, Result};
-use binder::{IBinder, Interface, ThreadState};
+use binder::{IBinder, Strong, ThreadState};
 use error::Error;
 use keystore2_selinux as selinux;
 
@@ -56,7 +56,7 @@ pub struct KeystoreService {
 
 impl KeystoreService {
     /// Create a new instance of the Keystore 2.0 service.
-    pub fn new_native_binder() -> Result<impl IKeystoreService> {
+    pub fn new_native_binder() -> Result<Strong<dyn IKeystoreService>> {
         let mut result: Self = Default::default();
         let (dev, uuid) =
             KeystoreSecurityLevel::new_native_binder(SecurityLevel::TRUSTED_ENVIRONMENT)
@@ -76,6 +76,15 @@ impl KeystoreService {
             result.uuid_by_sec_level.insert(SecurityLevel::STRONGBOX, uuid);
         }
 
+        let uuid_by_sec_level = result.uuid_by_sec_level.clone();
+        LEGACY_MIGRATOR
+            .set_init(move || {
+                (create_thread_local_db(), uuid_by_sec_level, LEGACY_BLOB_LOADER.clone())
+            })
+            .context(
+                "In KeystoreService::new_native_binder: Trying to initialize the legacy migrator.",
+            )?;
+
         let result = BnKeystoreService::new_binder(result);
         result.as_binder().set_requesting_sid(true);
         Ok(result)
@@ -89,7 +98,7 @@ impl KeystoreService {
             .unwrap_or(SecurityLevel::SOFTWARE)
     }
 
-    fn get_i_sec_level_by_uuid(&self, uuid: &Uuid) -> Result<Box<dyn IKeystoreSecurityLevel>> {
+    fn get_i_sec_level_by_uuid(&self, uuid: &Uuid) -> Result<Strong<dyn IKeystoreSecurityLevel>> {
         if let Some(dev) = self.i_sec_level_by_uuid.get(uuid) {
             dev.get_interface().context("In get_i_sec_level_by_uuid.")
         } else {
@@ -101,7 +110,7 @@ impl KeystoreService {
     fn get_security_level(
         &self,
         sec_level: SecurityLevel,
-    ) -> Result<Box<dyn IKeystoreSecurityLevel>> {
+    ) -> Result<Strong<dyn IKeystoreSecurityLevel>> {
         if let Some(dev) = self
             .uuid_by_sec_level
             .get(&sec_level)
@@ -115,15 +124,18 @@ impl KeystoreService {
     }
 
     fn get_key_entry(&self, key: &KeyDescriptor) -> Result<KeyEntryResponse> {
+        let caller_uid = ThreadState::get_calling_uid();
         let (key_id_guard, mut key_entry) = DB
             .with(|db| {
-                db.borrow_mut().load_key_entry(
-                    key.clone(),
-                    KeyType::Client,
-                    KeyEntryLoadBits::PUBLIC,
-                    ThreadState::get_calling_uid(),
-                    |k, av| check_key_permission(KeyPerm::get_info(), k, &av),
-                )
+                LEGACY_MIGRATOR.with_try_migrate(&key, caller_uid, || {
+                    db.borrow_mut().load_key_entry(
+                        &key,
+                        KeyType::Client,
+                        KeyEntryLoadBits::PUBLIC,
+                        caller_uid,
+                        |k, av| check_key_permission(KeyPerm::get_info(), k, &av),
+                    )
+                })
             })
             .context("In get_key_entry, while trying to load key info.")?;
 
@@ -164,18 +176,20 @@ impl KeystoreService {
         public_cert: Option<&[u8]>,
         certificate_chain: Option<&[u8]>,
     ) -> Result<()> {
+        let caller_uid = ThreadState::get_calling_uid();
         DB.with::<_, Result<()>>(|db| {
-            let mut db = db.borrow_mut();
-            let entry = match db.load_key_entry(
-                key.clone(),
-                KeyType::Client,
-                KeyEntryLoadBits::NONE,
-                ThreadState::get_calling_uid(),
-                |k, av| {
-                    check_key_permission(KeyPerm::update(), k, &av)
-                        .context("In update_subcomponent.")
-                },
-            ) {
+            let entry = match LEGACY_MIGRATOR.with_try_migrate(&key, caller_uid, || {
+                db.borrow_mut().load_key_entry(
+                    &key,
+                    KeyType::Client,
+                    KeyEntryLoadBits::NONE,
+                    caller_uid,
+                    |k, av| {
+                        check_key_permission(KeyPerm::update(), k, &av)
+                            .context("In update_subcomponent.")
+                    },
+                )
+            }) {
                 Err(e) => match e.root_cause().downcast_ref::<Error>() {
                     Some(Error::Rc(ResponseCode::KEY_NOT_FOUND)) => Ok(None),
                     _ => Err(e),
@@ -184,11 +198,12 @@ impl KeystoreService {
             }
             .context("Failed to load key entry.")?;
 
+            let mut db = db.borrow_mut();
             if let Some((key_id_guard, key_entry)) = entry {
-                db.set_blob(&key_id_guard, SubComponentType::CERT, public_cert)
+                db.set_blob(&key_id_guard, SubComponentType::CERT, public_cert, None)
                     .context("Failed to update cert subcomponent.")?;
 
-                db.set_blob(&key_id_guard, SubComponentType::CERT_CHAIN, certificate_chain)
+                db.set_blob(&key_id_guard, SubComponentType::CERT_CHAIN, certificate_chain, None)
                     .context("Failed to update cert chain subcomponent.")?;
                 return Ok(());
             }
@@ -219,7 +234,7 @@ impl KeystoreService {
             check_key_permission(KeyPerm::rebind(), &key, &None)
                 .context("Caller does not have permission to insert this certificate.")?;
 
-            db.store_new_certificate(key, certificate_chain.unwrap(), &KEYSTORE_UUID)
+            db.store_new_certificate(&key, certificate_chain.unwrap(), &KEYSTORE_UUID)
                 .context("Failed to insert new certificate.")?;
             Ok(())
         })
@@ -261,24 +276,34 @@ impl KeystoreService {
             Ok(()) => {}
         };
 
-        DB.with(|db| {
-            let mut db = db.borrow_mut();
-            db.list(k.domain, k.nspace)
-        })
+        let mut result = LEGACY_MIGRATOR
+            .list_uid(k.domain, k.nspace)
+            .context("In list_entries: Trying to list legacy keys.")?;
+
+        result.append(
+            &mut DB
+                .with(|db| {
+                    let mut db = db.borrow_mut();
+                    db.list(k.domain, k.nspace)
+                })
+                .context("In list_entries: Trying to list keystore database.")?,
+        );
+
+        result.sort_unstable();
+        result.dedup();
+        Ok(result)
     }
 
     fn delete_key(&self, key: &KeyDescriptor) -> Result<()> {
         let caller_uid = ThreadState::get_calling_uid();
-        let need_gc = DB
-            .with(|db| {
-                db.borrow_mut().unbind_key(key.clone(), KeyType::Client, caller_uid, |k, av| {
+        DB.with(|db| {
+            LEGACY_MIGRATOR.with_try_migrate(&key, caller_uid, || {
+                db.borrow_mut().unbind_key(&key, KeyType::Client, caller_uid, |k, av| {
                     check_key_permission(KeyPerm::delete(), k, &av).context("During delete_key.")
                 })
             })
-            .context("In delete_key: Trying to unbind the key.")?;
-        if need_gc {
-            Gc::notify_gc();
-        }
+        })
+        .context("In delete_key: Trying to unbind the key.")?;
         Ok(())
     }
 
@@ -288,26 +313,26 @@ impl KeystoreService {
         grantee_uid: i32,
         access_vector: permission::KeyPermSet,
     ) -> Result<KeyDescriptor> {
+        let caller_uid = ThreadState::get_calling_uid();
         DB.with(|db| {
-            db.borrow_mut().grant(
-                key.clone(),
-                ThreadState::get_calling_uid(),
-                grantee_uid as u32,
-                access_vector,
-                |k, av| check_grant_permission(*av, k).context("During grant."),
-            )
+            LEGACY_MIGRATOR.with_try_migrate(&key, caller_uid, || {
+                db.borrow_mut().grant(
+                    &key,
+                    caller_uid,
+                    grantee_uid as u32,
+                    access_vector,
+                    |k, av| check_grant_permission(*av, k).context("During grant."),
+                )
+            })
         })
         .context("In KeystoreService::grant.")
     }
 
     fn ungrant(&self, key: &KeyDescriptor, grantee_uid: i32) -> Result<()> {
         DB.with(|db| {
-            db.borrow_mut().ungrant(
-                key.clone(),
-                ThreadState::get_calling_uid(),
-                grantee_uid as u32,
-                |k| check_key_permission(KeyPerm::grant(), k, &None),
-            )
+            db.borrow_mut().ungrant(&key, ThreadState::get_calling_uid(), grantee_uid as u32, |k| {
+                check_key_permission(KeyPerm::grant(), k, &None)
+            })
         })
         .context("In KeystoreService::ungrant.")
     }
@@ -321,7 +346,7 @@ impl IKeystoreService for KeystoreService {
     fn getSecurityLevel(
         &self,
         security_level: SecurityLevel,
-    ) -> binder::public_api::Result<Box<dyn IKeystoreSecurityLevel>> {
+    ) -> binder::public_api::Result<Strong<dyn IKeystoreSecurityLevel>> {
         map_or_log_err(self.get_security_level(security_level), Ok)
     }
     fn getKeyEntry(&self, key: &KeyDescriptor) -> binder::public_api::Result<KeyEntryResponse> {
