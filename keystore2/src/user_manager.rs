@@ -24,6 +24,7 @@ use android_security_usermanager::aidl::android::security::usermanager::IKeystor
     BnKeystoreUserManager, IKeystoreUserManager,
 };
 use android_security_usermanager::binder::{Interface, Result as BinderResult};
+use android_system_keystore2::aidl::android::system::keystore2::Domain::Domain;
 use android_system_keystore2::aidl::android::system::keystore2::ResponseCode::ResponseCode;
 use anyhow::{Context, Result};
 use binder::{IBinder, Strong};
@@ -59,12 +60,12 @@ impl UserManager {
             .context("In on_user_password_changed.")?
         {
             UserState::LskfLocked => {
-                //error - password can not be changed when the device is locked
+                // Error - password can not be changed when the device is locked
                 Err(KeystoreError::Rc(ResponseCode::LOCKED))
                     .context("In on_user_password_changed. Device is locked.")
             }
             _ => {
-                //LskfLocked is the only error case for password change
+                // LskfLocked is the only error case for password change
                 Ok(())
             }
         }
@@ -74,7 +75,27 @@ impl UserManager {
         // Check permission. Function should return if this failed. Therefore having '?' at the end
         // is very important.
         check_keystore_permission(KeystorePerm::change_user()).context("In add_or_remove_user.")?;
-        DB.with(|db| UserState::reset_user(&mut db.borrow_mut(), &SUPER_KEY, user_id as u32, false))
+        DB.with(|db| {
+            UserState::reset_user(
+                &mut db.borrow_mut(),
+                &SUPER_KEY,
+                &LEGACY_MIGRATOR,
+                user_id as u32,
+                false,
+            )
+        })
+        .context("In add_or_remove_user: Trying to delete keys from db.")
+    }
+
+    fn clear_namespace(domain: Domain, nspace: i64) -> Result<()> {
+        // Permission check. Must return on error. Do not touch the '?'.
+        check_keystore_permission(KeystorePerm::clear_uid()).context("In clear_namespace.")?;
+
+        LEGACY_MIGRATOR
+            .bulk_delete_uid(domain, nspace)
+            .context("In clear_namespace: Trying to delete legacy keys.")?;
+        DB.with(|db| db.borrow_mut().unbind_keys_for_namespace(domain, nspace))
+            .context("In clear_namespace: Trying to delete keys from db.")
     }
 }
 
@@ -91,5 +112,9 @@ impl IKeystoreUserManager for UserManager {
 
     fn onUserRemoved(&self, user_id: i32) -> BinderResult<()> {
         map_or_log_err(Self::add_or_remove_user(user_id), Ok)
+    }
+
+    fn clearNamespace(&self, domain: Domain, nspace: i64) -> BinderResult<()> {
+        map_or_log_err(Self::clear_namespace(domain, nspace), Ok)
     }
 }

@@ -17,15 +17,19 @@
 use keystore2::apc::ApcManager;
 use keystore2::authorization::AuthorizationManager;
 use keystore2::globals::ENFORCEMENTS;
+use keystore2::remote_provisioning::RemoteProvisioningService;
 use keystore2::service::KeystoreService;
 use keystore2::user_manager::UserManager;
 use log::{error, info};
 use std::{panic, path::Path, sync::mpsc::channel};
+use vpnprofilestore::VpnProfileStore;
 
 static KS2_SERVICE_NAME: &str = "android.system.keystore2";
 static APC_SERVICE_NAME: &str = "android.security.apc";
 static AUTHORIZATION_SERVICE_NAME: &str = "android.security.authorization";
+static REMOTE_PROVISIONING_SERVICE_NAME: &str = "android.security.remoteprovisioning";
 static USER_MANAGER_SERVICE_NAME: &str = "android.security.usermanager";
+static VPNPROFILESTORE_SERVICE_NAME: &str = "android.security.vpnprofilestore";
 
 /// Keystore 2.0 takes one argument which is a path indicating its designated working directory.
 fn main() {
@@ -63,6 +67,13 @@ fn main() {
 
     ENFORCEMENTS.install_confirmation_token_receiver(confirmation_token_receiver);
 
+    info!("Starting boot level watcher.");
+    std::thread::spawn(|| {
+        keystore2::globals::ENFORCEMENTS
+            .watch_boot_level()
+            .unwrap_or_else(|e| error!("watch_boot_level failed: {}", e));
+    });
+
     info!("Starting thread pool now.");
     binder::ProcessState::start_thread_pool();
 
@@ -95,6 +106,33 @@ fn main() {
     binder::add_service(USER_MANAGER_SERVICE_NAME, usermanager_service.as_binder()).unwrap_or_else(
         |e| {
             panic!("Failed to register service {} because of {:?}.", USER_MANAGER_SERVICE_NAME, e);
+        },
+    );
+
+    // Devices with KS2 and KM 1.0 may not have any IRemotelyProvisionedComponent HALs at all. Do
+    // not panic if new_native_binder returns failure because it could not find the TEE HAL.
+    if let Ok(remote_provisioning_service) = RemoteProvisioningService::new_native_binder() {
+        binder::add_service(
+            REMOTE_PROVISIONING_SERVICE_NAME,
+            remote_provisioning_service.as_binder(),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to register service {} because of {:?}.",
+                REMOTE_PROVISIONING_SERVICE_NAME, e
+            );
+        });
+    }
+
+    let vpnprofilestore = VpnProfileStore::new_native_binder(
+        &keystore2::globals::DB_PATH.lock().expect("Could not get DB_PATH."),
+    );
+    binder::add_service(VPNPROFILESTORE_SERVICE_NAME, vpnprofilestore.as_binder()).unwrap_or_else(
+        |e| {
+            panic!(
+                "Failed to register service {} because of {:?}.",
+                VPNPROFILESTORE_SERVICE_NAME, e
+            );
         },
     );
 

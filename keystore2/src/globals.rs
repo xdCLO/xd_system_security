@@ -29,12 +29,13 @@ use crate::{
 };
 use crate::{enforcements::Enforcements, error::map_km_error};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
-    IKeyMintDevice::IKeyMintDevice, KeyMintHardwareInfo::KeyMintHardwareInfo,
-    SecurityLevel::SecurityLevel,
+    IKeyMintDevice::IKeyMintDevice, IRemotelyProvisionedComponent::IRemotelyProvisionedComponent,
+    KeyMintHardwareInfo::KeyMintHardwareInfo, SecurityLevel::SecurityLevel,
 };
 use android_hardware_security_keymint::binder::{StatusCode, Strong};
 use android_security_compat::aidl::android::security::compat::IKeystoreCompatService::IKeystoreCompatService;
 use anyhow::{Context, Result};
+use keystore2_vintf::get_aidl_instances;
 use lazy_static::lazy_static;
 use std::sync::{Arc, Mutex};
 use std::{cell::RefCell, sync::Once};
@@ -128,6 +129,21 @@ impl DevicesMap {
     }
 }
 
+#[derive(Default)]
+struct RemotelyProvisionedDevicesMap {
+    devices_by_sec_level: HashMap<SecurityLevel, Asp>,
+}
+
+impl RemotelyProvisionedDevicesMap {
+    fn dev_by_sec_level(&self, sec_level: &SecurityLevel) -> Option<Asp> {
+        self.devices_by_sec_level.get(sec_level).map(|dev| (*dev).clone())
+    }
+
+    fn insert(&mut self, sec_level: SecurityLevel, dev: Asp) {
+        self.devices_by_sec_level.insert(sec_level, dev);
+    }
+}
+
 lazy_static! {
     /// The path where keystore stores all its keys.
     pub static ref DB_PATH: Mutex<PathBuf> = Mutex::new(
@@ -138,11 +154,13 @@ lazy_static! {
     static ref KEY_MINT_DEVICES: Mutex<DevicesMap> = Default::default();
     /// Timestamp service.
     static ref TIME_STAMP_DEVICE: Mutex<Option<Asp>> = Default::default();
+    /// RemotelyProvisionedComponent HAL devices.
+    static ref REMOTELY_PROVISIONED_COMPONENT_DEVICES: Mutex<RemotelyProvisionedDevicesMap> = Default::default();
     /// A single on-demand worker thread that handles deferred tasks with two different
     /// priorities.
     pub static ref ASYNC_TASK: Arc<AsyncTask> = Default::default();
     /// Singleton for enforcements.
-    pub static ref ENFORCEMENTS: Enforcements = Enforcements::new();
+    pub static ref ENFORCEMENTS: Enforcements = Default::default();
     /// LegacyBlobLoader is initialized and exists globally.
     /// The same directory used by the database is used by the LegacyBlobLoader as well.
     pub static ref LEGACY_BLOB_LOADER: Arc<LegacyBlobLoader> = Arc::new(LegacyBlobLoader::new(
@@ -158,38 +176,49 @@ static KEYMINT_SERVICE_NAME: &str = "android.hardware.security.keymint.IKeyMintD
 /// If no native KeyMint device can be found this function also brings
 /// up the compatibility service and attempts to connect to the legacy wrapper.
 fn connect_keymint(security_level: &SecurityLevel) -> Result<(Asp, KeyMintHardwareInfo)> {
+    let keymint_instances =
+        get_aidl_instances("android.hardware.security.keymint", 1, "IKeyMintDevice");
+
     let service_name = match *security_level {
-        SecurityLevel::TRUSTED_ENVIRONMENT => format!("{}/default", KEYMINT_SERVICE_NAME),
-        SecurityLevel::STRONGBOX => format!("{}/strongbox", KEYMINT_SERVICE_NAME),
+        SecurityLevel::TRUSTED_ENVIRONMENT => {
+            if keymint_instances.as_vec()?.iter().any(|instance| *instance == "default") {
+                Some(format!("{}/default", KEYMINT_SERVICE_NAME))
+            } else {
+                None
+            }
+        }
+        SecurityLevel::STRONGBOX => {
+            if keymint_instances.as_vec()?.iter().any(|instance| *instance == "strongbox") {
+                Some(format!("{}/strongbox", KEYMINT_SERVICE_NAME))
+            } else {
+                None
+            }
+        }
         _ => {
             return Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
                 .context("In connect_keymint.")
         }
     };
 
-    let keymint = map_binder_status_code(binder::get_interface(&service_name))
-        .context("In connect_keymint: Trying to connect to genuine KeyMint service.")
-        .or_else(|e| {
-            match e.root_cause().downcast_ref::<Error>() {
-                Some(Error::BinderTransaction(StatusCode::NAME_NOT_FOUND)) => {
-                    // This is a no-op if it was called before.
-                    keystore2_km_compat::add_keymint_device_service();
+    let keymint = if let Some(service_name) = service_name {
+        map_binder_status_code(binder::get_interface(&service_name))
+            .context("In connect_keymint: Trying to connect to genuine KeyMint service.")
+    } else {
+        // This is a no-op if it was called before.
+        keystore2_km_compat::add_keymint_device_service();
 
-                    let keystore_compat_service: Strong<dyn IKeystoreCompatService> =
-                        map_binder_status_code(binder::get_interface("android.security.compat"))
-                            .context("In connect_keymint: Trying to connect to compat service.")?;
-                    map_binder_status(keystore_compat_service.getKeyMintDevice(*security_level))
-                        .map_err(|e| match e {
-                            Error::BinderTransaction(StatusCode::NAME_NOT_FOUND) => {
-                                Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)
-                            }
-                            e => e,
-                        })
-                        .context("In connect_keymint: Trying to get Legacy wrapper.")
+        let keystore_compat_service: Strong<dyn IKeystoreCompatService> =
+            map_binder_status_code(binder::get_interface("android.security.compat"))
+                .context("In connect_keymint: Trying to connect to compat service.")?;
+        map_binder_status(keystore_compat_service.getKeyMintDevice(*security_level))
+            .map_err(|e| match e {
+                Error::BinderTransaction(StatusCode::NAME_NOT_FOUND) => {
+                    Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)
                 }
-                _ => Err(e),
-            }
-        })?;
+                e => e,
+            })
+            .context("In connect_keymint: Trying to get Legacy wrapper.")
+    }?;
 
     let hw_info = map_km_error(keymint.getHardwareInfo())
         .context("In connect_keymint: Failed to get hardware info.")?;
@@ -233,33 +262,33 @@ static TIME_STAMP_SERVICE_NAME: &str = "android.hardware.security.secureclock.IS
 /// If no native SecureClock device can be found brings up the compatibility service and attempts
 /// to connect to the legacy wrapper.
 fn connect_secureclock() -> Result<Asp> {
-    let secureclock = map_binder_status_code(binder::get_interface(TIME_STAMP_SERVICE_NAME))
-        .context("In connect_secureclock: Trying to connect to genuine secure clock service.")
-        .or_else(|e| {
-            match e.root_cause().downcast_ref::<Error>() {
-                Some(Error::BinderTransaction(StatusCode::NAME_NOT_FOUND)) => {
-                    // This is a no-op if it was called before.
-                    keystore2_km_compat::add_keymint_device_service();
+    let secureclock_instances =
+        get_aidl_instances("android.hardware.security.secureclock", 1, "ISecureClock");
 
-                    let keystore_compat_service: Strong<dyn IKeystoreCompatService> =
-                        map_binder_status_code(binder::get_interface("android.security.compat"))
-                            .context(
-                                "In connect_secureclock: Trying to connect to compat service.",
-                            )?;
+    let secure_clock_available =
+        secureclock_instances.as_vec()?.iter().any(|instance| *instance == "default");
 
-                    // Legacy secure clock services were only implemented by TEE.
-                    map_binder_status(keystore_compat_service.getSecureClock())
-                        .map_err(|e| match e {
-                            Error::BinderTransaction(StatusCode::NAME_NOT_FOUND) => {
-                                Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)
-                            }
-                            e => e,
-                        })
-                        .context("In connect_secureclock: Trying to get Legacy wrapper.")
+    let secureclock = if secure_clock_available {
+        map_binder_status_code(binder::get_interface(TIME_STAMP_SERVICE_NAME))
+            .context("In connect_secureclock: Trying to connect to genuine secure clock service.")
+    } else {
+        // This is a no-op if it was called before.
+        keystore2_km_compat::add_keymint_device_service();
+
+        let keystore_compat_service: Strong<dyn IKeystoreCompatService> =
+            map_binder_status_code(binder::get_interface("android.security.compat"))
+                .context("In connect_secureclock: Trying to connect to compat service.")?;
+
+        // Legacy secure clock services were only implemented by TEE.
+        map_binder_status(keystore_compat_service.getSecureClock())
+            .map_err(|e| match e {
+                Error::BinderTransaction(StatusCode::NAME_NOT_FOUND) => {
+                    Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)
                 }
-                _ => Err(e),
-            }
-        })?;
+                e => e,
+            })
+            .context("In connect_secureclock: Trying to get Legacy wrapper.")
+    }?;
 
     Ok(Asp::new(secureclock.as_binder()))
 }
@@ -274,5 +303,57 @@ pub fn get_timestamp_service() -> Result<Asp> {
         let dev = connect_secureclock().context("In get_timestamp_service.")?;
         *ts_device = Some(dev.clone());
         Ok(dev)
+    }
+}
+
+static REMOTE_PROVISIONING_HAL_SERVICE_NAME: &str =
+    "android.hardware.security.keymint.IRemotelyProvisionedComponent";
+
+fn connect_remotely_provisioned_component(security_level: &SecurityLevel) -> Result<Asp> {
+    let remotely_prov_instances =
+        get_aidl_instances("android.hardware.security.keymint", 1, "IRemotelyProvisionedComponent");
+
+    let service_name = match *security_level {
+        SecurityLevel::TRUSTED_ENVIRONMENT => {
+            if remotely_prov_instances.as_vec()?.iter().any(|instance| *instance == "default") {
+                Some(format!("{}/default", REMOTE_PROVISIONING_HAL_SERVICE_NAME))
+            } else {
+                None
+            }
+        }
+        SecurityLevel::STRONGBOX => {
+            if remotely_prov_instances.as_vec()?.iter().any(|instance| *instance == "strongbox") {
+                Some(format!("{}/strongbox", REMOTE_PROVISIONING_HAL_SERVICE_NAME))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+    .ok_or(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
+    .context("In connect_remotely_provisioned_component.")?;
+
+    let rem_prov_hal: Strong<dyn IRemotelyProvisionedComponent> =
+        map_binder_status_code(binder::get_interface(&service_name))
+            .context(concat!(
+                "In connect_remotely_provisioned_component: Trying to connect to",
+                " RemotelyProvisionedComponent service."
+            ))
+            .map_err(|e| e)?;
+    Ok(Asp::new(rem_prov_hal.as_binder()))
+}
+
+/// Get a remote provisiong component device for the given security level either from the cache or
+/// by making a new connection. Returns the device.
+pub fn get_remotely_provisioned_component(security_level: &SecurityLevel) -> Result<Asp> {
+    let mut devices_map = REMOTELY_PROVISIONED_COMPONENT_DEVICES.lock().unwrap();
+    if let Some(dev) = devices_map.dev_by_sec_level(&security_level) {
+        Ok(dev)
+    } else {
+        let dev = connect_remotely_provisioned_component(security_level)
+            .context("In get_remotely_provisioned_component.")?;
+        devices_map.insert(*security_level, dev);
+        // Unwrap must succeed because we just inserted it.
+        Ok(devices_map.dev_by_sec_level(security_level).unwrap())
     }
 }
