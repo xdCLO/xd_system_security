@@ -193,6 +193,7 @@ implement_permission_aidl!(
     /// ```
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     KeyPerm from KeyPermission with default (NONE, none) {
+        CONVERT_STORAGE_KEY_TO_EPHEMERAL,   selinux name: convert_storage_key_to_ephemeral;
         DELETE,         selinux name: delete;
         GEN_UNIQUE_ID,  selinux name: gen_unique_id;
         GET_INFO,       selinux name: get_info;
@@ -291,7 +292,7 @@ implement_permission!(
         AddAuth = 1,    selinux name: add_auth;
         /// Checked when an app is uninstalled or wiped.
         ClearNs = 2,    selinux name: clear_ns;
-        /// Checked when Keystore 2.0 gets locked.
+        /// Checked when the user state is queried from Keystore 2.0.
         GetState = 4,   selinux name: get_state;
         /// Checked when Keystore 2.0 is asked to list a namespace that the caller
         /// does not have the get_info permission for.
@@ -308,6 +309,12 @@ implement_permission!(
         ChangePassword = 0x100,    selinux name: change_password;
         /// Checked when a UID is cleared.
         ClearUID = 0x200,    selinux name: clear_uid;
+        /// Checked when Credstore calls IKeystoreAuthorization to obtain auth tokens.
+        GetAuthToken = 0x400,  selinux name: get_auth_token;
+        /// Checked when earlyBootEnded() is called.
+        EarlyBootEnded = 0x800,   selinux name: early_boot_ended;
+        /// Checked when IKeystoreMaintenance::onDeviceOffBody is called.
+        ReportOffBody = 0x1000, selinux name: report_off_body;
     }
 );
 
@@ -582,6 +589,7 @@ mod tests {
         KeyPerm::rebind(),
         KeyPerm::update(),
         KeyPerm::use_(),
+        KeyPerm::convert_storage_key_to_ephemeral(),
     ];
 
     const SYSTEM_SERVER_PERMISSIONS_NO_GRANT: KeyPermSet = key_perm_set![
@@ -605,6 +613,7 @@ mod tests {
         KeyPerm::rebind(),
         KeyPerm::update(),
         KeyPerm::use_(),
+        KeyPerm::convert_storage_key_to_ephemeral(),
     ];
 
     const UNPRIV_PERMS: KeyPermSet = key_perm_set![
@@ -673,7 +682,7 @@ mod tests {
         let shell_ctx = Context::new("u:r:shell:s0")?;
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::add_auth()));
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::clear_ns()));
-        assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::get_state()));
+        assert!(check_keystore_permission(&shell_ctx, KeystorePerm::get_state()).is_ok());
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::list()));
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::lock()));
         assert_perm_failed!(check_keystore_permission(&shell_ctx, KeystorePerm::reset()));

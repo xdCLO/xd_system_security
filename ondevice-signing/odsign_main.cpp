@@ -26,8 +26,10 @@
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android-base/scopeguard.h>
 #include <logwrap/logwrap.h>
+#include <odrefresh/odrefresh.h>
 
 #include "CertUtils.h"
 #include "KeymasterSigningKey.h"
@@ -39,6 +41,7 @@
 using android::base::ErrnoError;
 using android::base::Error;
 using android::base::Result;
+using android::base::SetProperty;
 
 using OdsignInfo = ::odsign::proto::OdsignInfo;
 
@@ -54,7 +57,14 @@ static const char* kOdrefreshPath = "/apex/com.android.art/bin/odrefresh";
 static const char* kFsVerityProcPath = "/proc/sys/fs/verity";
 
 static const bool kForceCompilation = false;
-static const bool kUseKeystore = false;
+static const bool kUseKeystore = true;
+
+static const char* kOdsignVerificationDoneProp = "odsign.verification.done";
+static const char* kOdsignKeyDoneProp = "odsign.key.done";
+
+static const char* kOdsignVerificationStatusProp = "odsign.verification.success";
+static const char* kOdsignVerificationStatusValid = "1";
+static const char* kOdsignVerificationStatusError = "0";
 
 Result<void> verifyExistingCert(const SigningKey& key) {
     if (access(kSigningKeyCert.c_str(), F_OK) < 0) {
@@ -92,18 +102,11 @@ Result<void> createX509Cert(const SigningKey& key, const std::string& outPath) {
     return {};
 }
 
-bool compileArtifacts(bool force) {
+art::odrefresh::ExitCode compileArtifacts(bool force) {
     const char* const argv[] = {kOdrefreshPath, force ? "--force-compile" : "--compile"};
-
-    return logwrap_fork_execvp(arraysize(argv), argv, nullptr, false, LOG_ALOG, false, nullptr) ==
-           0;
-}
-
-bool validateArtifacts() {
-    const char* const argv[] = {kOdrefreshPath, "--check"};
-
-    return logwrap_fork_execvp(arraysize(argv), argv, nullptr, false, LOG_ALOG, false, nullptr) ==
-           0;
+    const int exit_code =
+        logwrap_fork_execvp(arraysize(argv), argv, nullptr, false, LOG_ALOG, false, nullptr);
+    return static_cast<art::odrefresh::ExitCode>(exit_code);
 }
 
 static std::string toHex(const std::vector<uint8_t>& digest) {
@@ -237,23 +240,67 @@ Result<void> persistDigests(const std::map<std::string, std::string>& digests,
     return {};
 }
 
-int main(int /* argc */, char** /* argv */) {
-    auto removeArtifacts = []() -> std::uintmax_t {
-        std::error_code ec;
-        auto num_removed = std::filesystem::remove_all(kArtArtifactsDir, ec);
-        if (ec) {
-            // TODO can't remove artifacts, signal Zygote shouldn't use them
-            LOG(ERROR) << "Can't remove " << kArtArtifactsDir << ": " << ec.message();
-            return 0;
-        } else {
-            if (num_removed > 0) {
-                LOG(INFO) << "Removed " << num_removed << " entries from " << kArtArtifactsDir;
-            }
-            return num_removed;
+static int removeArtifacts() {
+    std::error_code ec;
+    auto num_removed = std::filesystem::remove_all(kArtArtifactsDir, ec);
+    if (ec) {
+        LOG(ERROR) << "Can't remove " << kArtArtifactsDir << ": " << ec.message();
+        return 0;
+    } else {
+        if (num_removed > 0) {
+            LOG(INFO) << "Removed " << num_removed << " entries from " << kArtArtifactsDir;
         }
+        return num_removed;
+    }
+}
+
+static Result<void> verifyArtifacts(const SigningKey& key, bool supportsFsVerity) {
+    auto signInfo = getOdsignInfo(key);
+    // Tell init we're done with the key; this is a boot time optimization
+    // in particular for the no fs-verity case, where we need to do a
+    // costly verification. If the files haven't been tampered with, which
+    // should be the common path, the verification will succeed, and we won't
+    // need the key anymore. If it turns out the artifacts are invalid (eg not
+    // in fs-verity) or the hash doesn't match, we won't be able to generate
+    // new artifacts without the key, so in those cases, remove the artifacts,
+    // and use JIT zygote for the current boot. We should recover automatically
+    // by the next boot.
+    SetProperty(kOdsignKeyDoneProp, "1");
+    if (!signInfo.ok()) {
+        return Error() << signInfo.error().message();
+    }
+    std::map<std::string, std::string> trusted_digests(signInfo->file_hashes().begin(),
+                                                       signInfo->file_hashes().end());
+    Result<void> integrityStatus;
+
+    if (supportsFsVerity) {
+        integrityStatus = verifyIntegrityFsVerity(trusted_digests);
+    } else {
+        integrityStatus = verifyIntegrityNoFsVerity(trusted_digests);
+    }
+    if (!integrityStatus.ok()) {
+        return Error() << integrityStatus.error().message();
+    }
+
+    return {};
+}
+
+int main(int /* argc */, char** /* argv */) {
+    auto errorScopeGuard = []() {
+        // In case we hit any error, remove the artifacts and tell Zygote not to use anything
+        removeArtifacts();
+        // Tell init we don't need to use our key anymore
+        SetProperty(kOdsignKeyDoneProp, "1");
+        // Tell init we're done with verification, and that it was an error
+        SetProperty(kOdsignVerificationDoneProp, "1");
+        SetProperty(kOdsignVerificationStatusProp, kOdsignVerificationStatusError);
     };
-    // Make sure we delete the artifacts in all early (error) exit paths
-    auto scope_guard = android::base::make_scope_guard(removeArtifacts);
+    auto scope_guard = android::base::make_scope_guard(errorScopeGuard);
+
+    if (!android::base::GetBoolProperty("ro.apex.updatable", false)) {
+        LOG(INFO) << "Device doesn't support updatable APEX, exiting.";
+        return 0;
+    }
 
     SigningKey* key;
     if (kUseKeystore) {
@@ -301,40 +348,27 @@ int main(int /* argc */, char** /* argv */) {
         }
     }
 
-    auto signInfo = getOdsignInfo(*key);
-    if (!signInfo.ok()) {
-        int num_removed = removeArtifacts();
-        // Only a warning if there were artifacts to begin with, which suggests tampering or
-        // corruption
-        if (num_removed > 0) {
-            LOG(WARNING) << signInfo.error().message();
+    art::odrefresh::ExitCode odrefresh_status = compileArtifacts(kForceCompilation);
+    if (odrefresh_status == art::odrefresh::ExitCode::kOkay) {
+        LOG(INFO) << "odrefresh said artifacts are VALID";
+        // A post-condition of validating artifacts is that if the ones on /system
+        // are used, kArtArtifactsDir is removed. Conversely, if kArtArtifactsDir
+        // exists, those are artifacts that will be used, and we should verify them.
+        int err = access(kArtArtifactsDir.c_str(), F_OK);
+        // If we receive any error other than ENOENT, be suspicious
+        bool artifactsPresent = (err == 0) || (err < 0 && errno != ENOENT);
+        if (artifactsPresent) {
+            auto verificationResult = verifyArtifacts(*key, supportsFsVerity);
+            if (!verificationResult.ok()) {
+                LOG(ERROR) << verificationResult.error().message();
+                return -1;
+            }
         }
-    } else {
-        std::map<std::string, std::string> trusted_digests(signInfo->file_hashes().begin(),
-                                                           signInfo->file_hashes().end());
-        Result<void> integrityStatus;
-
-        if (supportsFsVerity) {
-            integrityStatus = verifyIntegrityFsVerity(trusted_digests);
-        } else {
-            integrityStatus = verifyIntegrityNoFsVerity(trusted_digests);
-        }
-        if (!integrityStatus.ok()) {
-            LOG(WARNING) << integrityStatus.error().message() << ", removing " << kArtArtifactsDir;
-            removeArtifacts();
-        }
-    }
-
-    // Ask ART whether it considers the artifacts valid
-    LOG(INFO) << "Asking odrefresh to verify artifacts (if present)...";
-    bool artifactsValid = validateArtifacts();
-    LOG(INFO) << "odrefresh said they are " << (artifactsValid ? "VALID" : "INVALID");
-
-    if (!artifactsValid || kForceCompilation) {
-        LOG(INFO) << "Starting compilation... ";
-        bool ret = compileArtifacts(kForceCompilation);
-        LOG(INFO) << "Compilation done, returned " << ret;
-
+    } else if (odrefresh_status == art::odrefresh::ExitCode::kCompilationSuccess ||
+               odrefresh_status == art::odrefresh::ExitCode::kCompilationFailed) {
+        const bool compiled_all = odrefresh_status == art::odrefresh::ExitCode::kCompilationSuccess;
+        LOG(INFO) << "odrefresh compiled " << (compiled_all ? "all" : "partial")
+                  << " artifacts, returned " << odrefresh_status;
         Result<std::map<std::string, std::string>> digests;
         if (supportsFsVerity) {
             digests = addFilesToVerityRecursive(kArtArtifactsDir, *key);
@@ -347,18 +381,26 @@ int main(int /* argc */, char** /* argv */) {
             LOG(ERROR) << digests.error().message();
             return -1;
         }
-
         auto persistStatus = persistDigests(*digests, *key);
         if (!persistStatus.ok()) {
             LOG(ERROR) << persistStatus.error().message();
             return -1;
         }
+    } else if (odrefresh_status == art::odrefresh::ExitCode::kCleanupFailed) {
+        LOG(ERROR) << "odrefresh failed cleaning up existing artifacts";
+        return -1;
+    } else {
+        LOG(ERROR) << "odrefresh exited unexpectedly, returned " << odrefresh_status;
+        return -1;
     }
 
-    // TODO we want to make sure Zygote only picks up the artifacts if we deemed
-    // everything was ok here. We could use a sysprop, or some other mechanism?
     LOG(INFO) << "On-device signing done.";
 
     scope_guard.Disable();
+    // At this point, we're done with the key for sure
+    SetProperty(kOdsignKeyDoneProp, "1");
+    // And we did a successful verification
+    SetProperty(kOdsignVerificationDoneProp, "1");
+    SetProperty(kOdsignVerificationStatusProp, kOdsignVerificationStatusValid);
     return 0;
 }

@@ -18,6 +18,7 @@ use crate::database::{AuthTokenEntry, MonotonicRawTime};
 use crate::error::{map_binder_status, Error, ErrorCode};
 use crate::globals::{get_timestamp_service, ASYNC_TASK, DB, ENFORCEMENTS};
 use crate::key_parameter::{KeyParameter, KeyParameterValue};
+use crate::{authorization::Error as AuthzError, super_key::SuperEncryptionType};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, ErrorCode::ErrorCode as Ec, HardwareAuthToken::HardwareAuthToken,
     HardwareAuthenticatorType::HardwareAuthenticatorType,
@@ -26,8 +27,9 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
 use android_hardware_security_secureclock::aidl::android::hardware::security::secureclock::{
     ISecureClock::ISecureClock, TimeStampToken::TimeStampToken,
 };
+use android_security_authorization::aidl::android::security::authorization::ResponseCode::ResponseCode as AuthzResponseCode;
 use android_system_keystore2::aidl::android::system::keystore2::{
-    IKeystoreSecurityLevel::KEY_FLAG_AUTH_BOUND_WITHOUT_CRYPTOGRAPHIC_LSKF_BINDING,
+    Domain::Domain, IKeystoreSecurityLevel::KEY_FLAG_AUTH_BOUND_WITHOUT_CRYPTOGRAPHIC_LSKF_BINDING,
     OperationChallenge::OperationChallenge,
 };
 use android_system_keystore2::binder::Strong;
@@ -218,7 +220,7 @@ fn timestamp_token_request(challenge: i64, sender: Sender<Result<TimeStampToken,
     if let Err(e) = sender.send(get_timestamp_token(challenge)) {
         log::info!(
             concat!(
-                "In timestamp_token_request: Operation hung up ",
+                "In timestamp_token_request: Receiver hung up ",
                 "before timestamp token could be delivered. {:?}"
             ),
             e
@@ -755,16 +757,92 @@ impl Enforcements {
     }
 
     /// Given the set of key parameters and flags, check if super encryption is required.
-    pub fn super_encryption_required(key_parameters: &[KeyParameter], flags: Option<i32>) -> bool {
-        let auth_bound = key_parameters.iter().any(|kp| kp.get_tag() == Tag::USER_SECURE_ID);
+    pub fn super_encryption_required(
+        domain: &Domain,
+        key_parameters: &[KeyParameter],
+        flags: Option<i32>,
+    ) -> SuperEncryptionType {
+        if *domain != Domain::APP {
+            return SuperEncryptionType::None;
+        }
+        if let Some(flags) = flags {
+            if (flags & KEY_FLAG_AUTH_BOUND_WITHOUT_CRYPTOGRAPHIC_LSKF_BINDING) != 0 {
+                return SuperEncryptionType::None;
+            }
+        }
+        if key_parameters
+            .iter()
+            .any(|kp| matches!(kp.key_parameter_value(), KeyParameterValue::UnlockedDeviceRequired))
+        {
+            return SuperEncryptionType::ScreenLockBound;
+        }
+        if key_parameters
+            .iter()
+            .any(|kp| matches!(kp.key_parameter_value(), KeyParameterValue::UserSecureID(_)))
+        {
+            return SuperEncryptionType::LskfBound;
+        }
+        SuperEncryptionType::None
+    }
 
-        let skip_lskf_binding = if let Some(flags) = flags {
-            (flags & KEY_FLAG_AUTH_BOUND_WITHOUT_CRYPTOGRAPHIC_LSKF_BINDING) != 0
+    /// Finds a matching auth token along with a timestamp token.
+    /// This method looks through auth-tokens cached by keystore which satisfy the given
+    /// authentication information (i.e. |secureUserId|).
+    /// The most recent matching auth token which has a |challenge| field which matches
+    /// the passed-in |challenge| parameter is returned.
+    /// In this case the |authTokenMaxAgeMillis| parameter is not used.
+    ///
+    /// Otherwise, the most recent matching auth token which is younger than |authTokenMaxAgeMillis|
+    /// is returned.
+    pub fn get_auth_tokens(
+        &self,
+        challenge: i64,
+        secure_user_id: i64,
+        auth_token_max_age_millis: i64,
+    ) -> Result<(HardwareAuthToken, TimeStampToken)> {
+        let auth_type = HardwareAuthenticatorType::ANY;
+        let sids: Vec<i64> = vec![secure_user_id];
+        // Filter the matching auth tokens by challenge
+        let result = Self::find_auth_token(|hat: &AuthTokenEntry| {
+            (challenge == hat.challenge()) && hat.satisfies(&sids, auth_type)
+        })
+        .context(
+            "In get_auth_tokens: Failed to get a matching auth token filtered by challenge.",
+        )?;
+
+        let auth_token = if let Some((auth_token_entry, _)) = result {
+            auth_token_entry.take_auth_token()
         } else {
-            false
-        };
+            // Filter the matching auth tokens by age.
+            if auth_token_max_age_millis != 0 {
+                let now_in_millis = MonotonicRawTime::now().milli_seconds();
+                let result = Self::find_auth_token(|auth_token_entry: &AuthTokenEntry| {
+                    let token_valid = now_in_millis
+                        .checked_sub(auth_token_entry.time_received().milli_seconds())
+                        .map_or(false, |token_age_in_millis| {
+                            auth_token_max_age_millis > token_age_in_millis
+                        });
+                    token_valid && auth_token_entry.satisfies(&sids, auth_type)
+                })
+                .context(
+                    "In get_auth_tokens: Failed to get a matching auth token filtered by age.",
+                )?;
 
-        auth_bound && !skip_lskf_binding
+                if let Some((auth_token_entry, _)) = result {
+                    auth_token_entry.take_auth_token()
+                } else {
+                    return Err(AuthzError::Rc(AuthzResponseCode::NO_AUTH_TOKEN_FOUND))
+                        .context("In get_auth_tokens: No auth token found.");
+                }
+            } else {
+                return Err(AuthzError::Rc(AuthzResponseCode::NO_AUTH_TOKEN_FOUND))
+                    .context("In get_auth_tokens: Passed-in auth token max age is zero.");
+            }
+        };
+        // Wait and obtain the timestamp token from secure clock service.
+        let tst = get_timestamp_token(challenge)
+            .context("In get_auth_tokens. Error in getting timestamp token.")?;
+        Ok((auth_token, tst))
     }
 
     /// Watch the `keystore.boot_level` system property, and keep self.boot_level up to date.

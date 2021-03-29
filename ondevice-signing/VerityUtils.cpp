@@ -16,6 +16,7 @@
 
 #include <filesystem>
 #include <map>
+#include <span>
 #include <string>
 
 #include <fcntl.h>
@@ -56,7 +57,7 @@ struct fsverity_signed_digest {
     __u8 digest[];
 };
 
-static std::string toHex(const std::vector<uint8_t>& data) {
+static std::string toHex(std::span<uint8_t> data) {
     std::stringstream ss;
     for (auto it = data.begin(); it != data.end(); ++it) {
         ss << std::setfill('0') << std::setw(2) << std::hex << static_cast<unsigned>(*it);
@@ -73,8 +74,14 @@ static int read_callback(void* file, void* buf, size_t count) {
 Result<std::vector<uint8_t>> createDigest(const std::string& path) {
     struct stat filestat;
     unique_fd fd(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_CLOEXEC)));
+    if (fd < 0) {
+        return ErrnoError() << "Failed to open " << path;
+    }
 
-    stat(path.c_str(), &filestat);
+    int ret = stat(path.c_str(), &filestat);
+    if (ret < 0) {
+        return ErrnoError() << "Failed to stat " << path;
+    }
     struct libfsverity_merkle_tree_params params = {
         .version = 1,
         .hash_algorithm = FS_VERITY_HASH_ALG_SHA256,
@@ -83,24 +90,45 @@ Result<std::vector<uint8_t>> createDigest(const std::string& path) {
     };
 
     struct libfsverity_digest* digest;
-    libfsverity_compute_digest(&fd, &read_callback, &params, &digest);
+    ret = libfsverity_compute_digest(&fd, &read_callback, &params, &digest);
+    if (ret < 0) {
+        return ErrnoError() << "Failed to compute fs-verity digest for " << path;
+    }
+    std::vector<uint8_t> digestVector(&digest->digest[0], &digest->digest[32]);
+    free(digest);
+    return digestVector;
+}
 
-    return std::vector<uint8_t>(&digest->digest[0], &digest->digest[32]);
+namespace {
+template <typename T> struct DeleteAsPODArray {
+    void operator()(T* x) {
+        if (x) {
+            x->~T();
+            delete[](uint8_t*) x;
+        }
+    }
+};
+}  // namespace
+
+template <typename T> using trailing_unique_ptr = std::unique_ptr<T, DeleteAsPODArray<T>>;
+
+template <typename T>
+static trailing_unique_ptr<T> makeUniqueWithTrailingData(size_t trailing_data_size) {
+    uint8_t* memory = new uint8_t[sizeof(T*) + trailing_data_size];
+    T* ptr = new (memory) T;
+    return trailing_unique_ptr<T>{ptr};
 }
 
 static Result<std::vector<uint8_t>> signDigest(const SigningKey& key,
                                                const std::vector<uint8_t>& digest) {
-    fsverity_signed_digest* d;
-    size_t signed_digest_size = sizeof(*d) + digest.size();
-    std::unique_ptr<uint8_t[]> digest_buffer{new uint8_t[signed_digest_size]};
-    d = (fsverity_signed_digest*)digest_buffer.get();
+    auto d = makeUniqueWithTrailingData<fsverity_signed_digest>(digest.size());
 
     memcpy(d->magic, "FSVerity", 8);
     d->digest_algorithm = cpu_to_le16(FS_VERITY_HASH_ALG_SHA256);
     d->digest_size = cpu_to_le16(digest.size());
     memcpy(d->digest, digest.data(), digest.size());
 
-    auto signed_digest = key.sign(std::string((char*)d, signed_digest_size));
+    auto signed_digest = key.sign(std::string((char*)d.get(), sizeof(*d) + digest.size()));
     if (!signed_digest.ok()) {
         return signed_digest.error();
     }
@@ -181,16 +209,13 @@ Result<std::string> isFileInVerity(const std::string& path) {
         return Error() << "File is not in fs-verity: " << path;
     }
 
-    struct fsverity_digest* d;
-    d = (struct fsverity_digest*)malloc(sizeof(*d) + FS_VERITY_MAX_DIGEST_SIZE);
+    auto d = makeUniqueWithTrailingData<fsverity_digest>(FS_VERITY_MAX_DIGEST_SIZE);
     d->digest_size = FS_VERITY_MAX_DIGEST_SIZE;
-    ret = ioctl(fd, FS_IOC_MEASURE_VERITY, d);
+    ret = ioctl(fd, FS_IOC_MEASURE_VERITY, d.get());
     if (ret < 0) {
         return ErrnoError() << "Failed to FS_IOC_MEASURE_VERITY for " << path;
     }
-    std::vector<uint8_t> digest_vector(&d->digest[0], &d->digest[d->digest_size]);
-
-    return toHex(digest_vector);
+    return toHex({&d->digest[0], &d->digest[d->digest_size]});
 }
 
 Result<std::map<std::string, std::string>> verifyAllFilesInVerity(const std::string& path) {
