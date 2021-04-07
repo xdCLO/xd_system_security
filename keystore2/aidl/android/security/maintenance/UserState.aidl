@@ -1,4 +1,4 @@
-// Copyright 2020, The Android Open Source Project
+// Copyright 2021, The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package android.security.authorization;
+package android.security.maintenance;
 
 /** @hide */
 @Backing(type="int")
-enum LockScreenEvent {
-    UNLOCK = 0,
-    LOCK = 1,
+enum UserState {
+    UNINITIALIZED = 0,
+    LSKF_UNLOCKED = 1,
+    LSKF_LOCKED = 2,
 }

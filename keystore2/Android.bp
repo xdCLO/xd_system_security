@@ -29,15 +29,17 @@ rust_defaults {
     rustlibs: [
         "android.hardware.security.keymint-V1-rust",
         "android.hardware.security.secureclock-V1-rust",
+        "android.hardware.security.sharedsecret-V1-rust",
         "android.os.permissions_aidl-rust",
         "android.security.apc-rust",
         "android.security.authorization-rust",
         "android.security.compat-rust",
+        "android.security.maintenance-rust",
         "android.security.remoteprovisioning-rust",
-        "android.security.usermanager-rust",
         "android.system.keystore2-V1-rust",
         "libanyhow",
         "libbinder_rs",
+        "libcutils_bindgen",
         "libkeystore2_aaid-rust",
         "libkeystore2_apc_compat-rust",
         "libkeystore2_crypto_rust",
@@ -51,7 +53,11 @@ rust_defaults {
         "liblog_rust",
         "librand",
         "librusqlite",
+        "libstatslog_rust",
         "libthiserror",
+    ],
+    shared_libs: [
+        "libcutils",
     ],
 }
 

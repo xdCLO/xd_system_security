@@ -1,4 +1,4 @@
-// Copyright 2020, The Android Open Source Project
+// Copyright 2021, The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,20 @@
 
 package android.security.authorization;
 
-/** @hide */
-@Backing(type="int")
-enum LockScreenEvent {
-    UNLOCK = 0,
-    LOCK = 1,
+import android.hardware.security.keymint.HardwareAuthToken;
+import android.hardware.security.secureclock.TimeStampToken;
+
+/**
+ * This parcelable is returned by `IKeystoreAuthorization::getAuthTokensForCredStore`.
+ * @hide
+ */
+parcelable AuthorizationTokens {
+    /**
+     * HardwareAuthToken provided by an authenticator.
+     */
+    HardwareAuthToken authToken;
+    /**
+     * TimeStampToken provided by a SecureClock.
+     */
+    TimeStampToken timestampToken;
 }

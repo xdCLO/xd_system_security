@@ -16,6 +16,7 @@
 
 package android.security.remoteprovisioning;
 
+import android.hardware.security.keymint.DeviceInfo;
 import android.hardware.security.keymint.ProtectedData;
 import android.hardware.security.keymint.SecurityLevel;
 import android.security.remoteprovisioning.AttestationPoolStatus;
@@ -90,7 +91,7 @@ interface IRemoteProvisioning {
      *                         request.
      */
     byte[] generateCsr(in boolean testMode, in int numCsr, in byte[] eek, in byte[] challenge,
-        in SecurityLevel secLevel, out ProtectedData protectedData);
+        in SecurityLevel secLevel, out ProtectedData protectedData, out DeviceInfo deviceInfo);
 
     /**
      * This method provides a way for the returned attestation certificate chains to be provisioned
@@ -133,4 +134,13 @@ interface IRemoteProvisioning {
      * @return The array of security levels.
      */
      SecurityLevel[] getSecurityLevels();
+
+    /**
+     * This method deletes all remotely provisioned attestation keys in the database, regardless
+     * of what state in their life cycle they are in. This is primarily useful to facilitate
+     * testing.
+     *
+     * @return Number of keys deleted
+     */
+    long deleteAllKeys();
 }
