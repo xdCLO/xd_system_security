@@ -326,7 +326,8 @@ impl KeystoreSecurityLevel {
         let operation = match begin_result.operation {
             Some(km_op) => {
                 self.operation_db.create_operation(km_op, caller_uid, auth_info, forced,
-                    LoggingInfo::new(purpose, op_params, upgraded_blob.is_some()))
+                    LoggingInfo::new(self.security_level, purpose, op_params,
+                         upgraded_blob.is_some()))
             },
             None => return Err(Error::sys()).context("In create_operation: Begin operation returned successfully, but did not return a valid operation."),
         };
@@ -686,7 +687,7 @@ impl KeystoreSecurityLevel {
             SuperKeyManager::reencrypt_if_required(key_blob, &upgraded_blob)
                 .context("In store_upgraded_keyblob: Failed to handle super encryption.")?;
 
-        let mut new_blob_metadata = new_blob_metadata.unwrap_or_else(BlobMetaData::new);
+        let mut new_blob_metadata = new_blob_metadata.unwrap_or_default();
         if let Some(uuid) = km_uuid {
             new_blob_metadata.add(BlobMetaEntry::KmUuid(*uuid));
         }
@@ -832,7 +833,7 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         entropy: &[u8],
     ) -> binder::public_api::Result<KeyMetadata> {
         let result = self.generate_key(key, attestation_key, params, flags, entropy);
-        log_key_creation_event_stats(params, &result);
+        log_key_creation_event_stats(self.security_level, params, &result);
         map_or_log_err(result, Ok)
     }
     fn importKey(
@@ -844,7 +845,7 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         key_data: &[u8],
     ) -> binder::public_api::Result<KeyMetadata> {
         let result = self.import_key(key, attestation_key, params, flags, key_data);
-        log_key_creation_event_stats(params, &result);
+        log_key_creation_event_stats(self.security_level, params, &result);
         map_or_log_err(result, Ok)
     }
     fn importWrappedKey(
@@ -857,7 +858,7 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
     ) -> binder::public_api::Result<KeyMetadata> {
         let result =
             self.import_wrapped_key(key, wrapping_key, masking_key, params, authenticators);
-        log_key_creation_event_stats(params, &result);
+        log_key_creation_event_stats(self.security_level, params, &result);
         map_or_log_err(result, Ok)
     }
     fn convertStorageKeyToEphemeral(

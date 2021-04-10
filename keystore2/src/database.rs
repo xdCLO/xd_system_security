@@ -186,6 +186,9 @@ impl_metadata!(
         KmUuid(Uuid) with accessor km_uuid,
         /// If the key is ECDH encrypted, this is the ephemeral public key
         PublicKey(Vec<u8>) with accessor public_key,
+        /// If the key is encrypted with a MaxBootLevel key, this is the boot level
+        /// of that key
+        MaxBootLevel(i32) with accessor max_boot_level,
         //  --- ADD NEW META DATA FIELDS HERE ---
         // For backwards compatibility add new entries only to
         // end of this list and above this comment.
@@ -3025,7 +3028,7 @@ mod tests {
     where
         F: Fn(&Uuid, &[u8]) -> Result<()> + Send + 'static,
     {
-        let super_key = Arc::new(SuperKeyManager::new());
+        let super_key: Arc<SuperKeyManager> = Default::default();
 
         let gc_db = KeystoreDB::new(path, None).expect("Failed to open test gc db_connection.");
         let gc = Gc::new_init_with(Default::default(), move || (Box::new(cb), gc_db, super_key));
