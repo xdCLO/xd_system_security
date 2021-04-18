@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// TODO: Once this is stable, remove this and document everything public.
-#![allow(missing_docs)]
+//! Export into Rust a function to create a KeyMintDevice and add it as a service.
 
+#[allow(missing_docs)] // TODO remove this
 extern "C" {
     fn addKeyMintDeviceService() -> i32;
 }
 
+#[allow(missing_docs)] // TODO remove this
 pub fn add_keymint_device_service() -> i32 {
     unsafe { addKeyMintDeviceService() }
 }
@@ -31,8 +32,8 @@ mod tests {
         Algorithm::Algorithm, BeginResult::BeginResult, BlockMode::BlockMode, Digest::Digest,
         ErrorCode::ErrorCode, HardwareAuthToken::HardwareAuthToken, IKeyMintDevice::IKeyMintDevice,
         KeyCreationResult::KeyCreationResult, KeyFormat::KeyFormat, KeyParameter::KeyParameter,
-        KeyParameterArray::KeyParameterArray, KeyParameterValue::KeyParameterValue,
-        KeyPurpose::KeyPurpose, PaddingMode::PaddingMode, SecurityLevel::SecurityLevel, Tag::Tag,
+        KeyParameterValue::KeyParameterValue, KeyPurpose::KeyPurpose, PaddingMode::PaddingMode,
+        SecurityLevel::SecurityLevel, Tag::Tag,
     };
     use android_hardware_security_keymint::binder::{self, Strong};
     use android_security_compat::aidl::android::security::compat::IKeystoreCompatService::IKeystoreCompatService;
@@ -283,49 +284,67 @@ mod tests {
 
         let begin_result = begin(legacy.as_ref(), &blob, KeyPurpose::ENCRYPT, None);
         let operation = begin_result.operation.unwrap();
-        let params = KeyParameterArray {
-            params: vec![KeyParameter {
-                tag: Tag::ASSOCIATED_DATA,
-                value: KeyParameterValue::Blob(b"foobar".to_vec()),
-            }],
-        };
+
+        let update_aad_result = operation.updateAad(
+            &b"foobar".to_vec(),
+            None, /* authToken */
+            None, /* timestampToken */
+        );
+        assert!(update_aad_result.is_ok(), "{:?}", update_aad_result);
+
         let message = [42; 128];
-        let mut out_params = None;
-        let result =
-            operation.finish(Some(&params), Some(&message), None, None, None, &mut out_params);
+        let result = operation.finish(
+            Some(&message),
+            None, /* signature */
+            None, /* authToken */
+            None, /* timestampToken */
+            None, /* confirmationToken */
+        );
         assert!(result.is_ok(), "{:?}", result);
         let ciphertext = result.unwrap();
         assert!(!ciphertext.is_empty());
-        assert!(out_params.is_some());
 
         let begin_result =
             begin(legacy.as_ref(), &blob, KeyPurpose::DECRYPT, Some(begin_result.params));
+
         let operation = begin_result.operation.unwrap();
-        let mut out_params = None;
-        let mut output = None;
+
+        let update_aad_result = operation.updateAad(
+            &b"foobar".to_vec(),
+            None, /* authToken */
+            None, /* timestampToken */
+        );
+        assert!(update_aad_result.is_ok(), "{:?}", update_aad_result);
+
         let result = operation.update(
-            Some(&params),
-            Some(&ciphertext),
-            None,
-            None,
-            &mut out_params,
-            &mut output,
+            &ciphertext,
+            None, /* authToken */
+            None, /* timestampToken */
         );
         assert!(result.is_ok(), "{:?}", result);
-        assert_eq!(result.unwrap(), message.len() as i32);
-        assert!(output.is_some());
-        assert_eq!(output.unwrap().data, message.to_vec());
-        let result = operation.finish(Some(&params), None, None, None, None, &mut out_params);
+        assert_eq!(result.unwrap(), message);
+        let result = operation.finish(
+            None, /* input */
+            None, /* signature */
+            None, /* authToken */
+            None, /* timestampToken */
+            None, /* confirmationToken */
+        );
         assert!(result.is_ok(), "{:?}", result);
-        assert!(out_params.is_some());
     }
 
     #[test]
     fn test_secure_clock() {
         add_keymint_device_service();
         let compat_service: binder::Strong<dyn IKeystoreCompatService> =
-            binder::get_interface(COMPAT_NAME).unwrap();
-        let secure_clock = compat_service.getSecureClock().unwrap();
+            match binder::get_interface(COMPAT_NAME) {
+                Ok(cs) => cs,
+                _ => return,
+            };
+        let secure_clock = match compat_service.getSecureClock() {
+            Ok(sc) => sc,
+            _ => return,
+        };
 
         let challenge = 42;
         let result = secure_clock.generateTimeStamp(challenge);
@@ -339,9 +358,15 @@ mod tests {
     fn test_shared_secret() {
         add_keymint_device_service();
         let compat_service: binder::Strong<dyn IKeystoreCompatService> =
-            binder::get_interface(COMPAT_NAME).unwrap();
-        let shared_secret =
-            compat_service.getSharedSecret(SecurityLevel::TRUSTED_ENVIRONMENT).unwrap();
+            match binder::get_interface(COMPAT_NAME) {
+                Ok(cs) => cs,
+                _ => return,
+            };
+        let shared_secret = match compat_service.getSharedSecret(SecurityLevel::TRUSTED_ENVIRONMENT)
+        {
+            Ok(ss) => ss,
+            _ => return,
+        };
 
         let result = shared_secret.getSharedSecretParameters();
         assert!(result.is_ok(), "{:?}", result);

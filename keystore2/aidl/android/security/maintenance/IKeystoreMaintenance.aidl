@@ -12,19 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package android.security.usermanager;
+package android.security.maintenance;
+
+import android.system.keystore2.Domain;
+import android.security.maintenance.UserState;
 
 // TODO: mark the interface with @SensitiveData when the annotation is ready (b/176110256).
 
 /**
- * IKeystoreUserManager interface exposes the methods for adding/removing users and changing the
+ * IKeystoreMaintenance interface exposes the methods for adding/removing users and changing the
  * user's password.
+ * @hide
  */
-interface IKeystoreUserManager {
+interface IKeystoreMaintenance {
 
     /**
      * Allows LockSettingsService to inform keystore about adding a new user.
      * Callers require 'AddUser' permission.
+     *
      * ## Error conditions:
      * `ResponseCode::PERMISSION_DENIED` - if the callers do not have the 'AddUser' permission.
      * `ResponseCode::SYSTEM_ERROR` - if failed to delete the keys of an existing user with the same
@@ -37,6 +42,7 @@ interface IKeystoreUserManager {
     /**
      * Allows LockSettingsService to inform keystore about removing a user.
      * Callers require 'RemoveUser' permission.
+     *
      * ## Error conditions:
      * `ResponseCode::PERMISSION_DENIED` - if the callers do not have the 'RemoveUser' permission.
      * `ResponseCode::SYSTEM_ERROR` - if failed to delete the keys of the user being deleted.
@@ -48,8 +54,9 @@ interface IKeystoreUserManager {
     /**
      * Allows LockSettingsService to inform keystore about password change of a user.
      * Callers require 'ChangePassword' permission.
+     *
      * ## Error conditions:
-     * `ResponseCode::PERMISSION_DENIED` - if the callers do not have the 'ChangePassword'
+     * `ResponseCode::PERMISSION_DENIED` - if the callers does not have the 'ChangePassword'
      *                                     permission.
      * `ResponseCode::SYSTEM_ERROR` - if failed to delete the super encrypted keys of the user.
      * `ResponseCode::Locked' -  if the keystore is locked for the given user.
@@ -58,4 +65,47 @@ interface IKeystoreUserManager {
      * @param password - a secret derived from the synthetic password of the user
      */
     void onUserPasswordChanged(in int userId, in @nullable byte[] password);
+
+    /**
+     * This function deletes all keys within a namespace. It mainly gets called when an app gets
+     * removed and all resources of this app need to be cleaned up.
+     *
+     * @param domain - One of Domain.APP or Domain.SELINUX.
+     * @param nspace - The UID of the app that is to be cleared if domain is Domain.APP or
+     *                 the SEPolicy namespace if domain is Domain.SELINUX.
+     */
+    void clearNamespace(Domain domain, long nspace);
+
+    /**
+     * Allows querying user state, given user id.
+     * Callers require 'GetState' permission.
+     *
+     * ## Error conditions:
+     * `ResponseCode::PERMISSION_DENIED` - if the callers do not have the 'GetState'
+     *                                     permission.
+     * `ResponseCode::SYSTEM_ERROR` - if an error occurred when querying the user state.
+     *
+     * @param userId - Android user id
+     */
+    UserState getState(in int userId);
+
+    /**
+     * This function notifies the Keymint device of the specified securityLevel that
+     * early boot has ended, so that they no longer allow early boot keys to be used.
+     * ## Error conditions:
+     * `ResponseCode::PERMISSION_DENIED` - if the caller does not have the 'EarlyBootEnded'
+     *                                     permission.
+     * A KeyMint ErrorCode may be returned indicating a backend diagnosed error.
+     */
+     void earlyBootEnded();
+
+    /**
+     * Informs Keystore 2.0 that the an off body event was detected.
+     *
+     * ## Error conditions:
+     * `ResponseCode::PERMISSION_DENIED` - if the caller does not have the `ReportOffBody`
+     *                                     permission.
+     * `ResponseCode::SYSTEM_ERROR` - if an unexpected error occurred.
+     */
+    void onDeviceOffBody();
 }

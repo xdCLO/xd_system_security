@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! This module implements methods to load legacy keystore key blob files.
 
 use crate::{
@@ -26,7 +24,8 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
     SecurityLevel::SecurityLevel, Tag::Tag, TagType::TagType,
 };
 use anyhow::{Context, Result};
-use keystore2_crypto::{aes_gcm_decrypt, derive_key_from_password, ZVec};
+use keystore2_crypto::{aes_gcm_decrypt, Password, ZVec};
+use std::collections::{HashMap, HashSet};
 use std::{convert::TryInto, fs::File, path::Path, path::PathBuf};
 use std::{
     fs,
@@ -215,7 +214,7 @@ impl LegacyBlobLoader {
     // flags (1 Byte)
     // info (1 Byte)
     // initialization_vector (16 Bytes)
-    // integrity (MD5 digest or gcb tag) (16 Bytes)
+    // integrity (MD5 digest or gcm tag) (16 Bytes)
     // length (4 Bytes)
     const COMMON_HEADER_SIZE: usize = 4 + Self::IV_SIZE + Self::GCM_TAG_LENGTH + 4;
 
@@ -226,7 +225,7 @@ impl LegacyBlobLoader {
     const LENGTH_OFFSET: usize = 4 + Self::IV_SIZE + Self::GCM_TAG_LENGTH;
     const IV_OFFSET: usize = 4;
     const AEAD_TAG_OFFSET: usize = Self::IV_OFFSET + Self::IV_SIZE;
-    const DIGEST_OFFSET: usize = Self::IV_OFFSET + Self::IV_SIZE;
+    const _DIGEST_OFFSET: usize = Self::IV_OFFSET + Self::IV_SIZE;
 
     /// Construct a new LegacyBlobLoader with a root path of `path` relative to which it will
     /// expect legacy key blob files.
@@ -633,8 +632,98 @@ impl LegacyBlobLoader {
         Ok(Some(Self::new_from_stream(&mut file).context("In read_generic_blob.")?))
     }
 
-    /// This function constructs the blob file name which has the form:
+    /// Read a legacy vpn profile blob.
+    pub fn read_vpn_profile(&self, uid: u32, alias: &str) -> Result<Option<Vec<u8>>> {
+        let path = match self.make_vpn_profile_filename(uid, alias) {
+            Some(path) => path,
+            None => return Ok(None),
+        };
+
+        let blob =
+            Self::read_generic_blob(&path).context("In read_vpn_profile: Failed to read blob.")?;
+
+        Ok(blob.and_then(|blob| match blob.value {
+            BlobValue::Generic(blob) => Some(blob),
+            _ => {
+                log::info!("Unexpected vpn profile blob type. Ignoring");
+                None
+            }
+        }))
+    }
+
+    /// Remove a vpn profile by the name alias with owner uid.
+    pub fn remove_vpn_profile(&self, uid: u32, alias: &str) -> Result<()> {
+        let path = match self.make_vpn_profile_filename(uid, alias) {
+            Some(path) => path,
+            None => return Ok(()),
+        };
+
+        if let Err(e) = Self::with_retry_interrupted(|| fs::remove_file(path.as_path())) {
+            match e.kind() {
+                ErrorKind::NotFound => return Ok(()),
+                _ => return Err(e).context("In remove_vpn_profile."),
+            }
+        }
+
+        let user_id = uid_to_android_user(uid);
+        self.remove_user_dir_if_empty(user_id)
+            .context("In remove_vpn_profile: Trying to remove empty user dir.")
+    }
+
+    fn is_vpn_profile(encoded_alias: &str) -> bool {
+        // We can check the encoded alias because the prefixes we are interested
+        // in are all in the printable range that don't get mangled.
+        encoded_alias.starts_with("VPN_")
+            || encoded_alias.starts_with("PLATFORM_VPN_")
+            || encoded_alias == "LOCKDOWN_VPN"
+    }
+
+    /// List all profiles belonging to the given uid.
+    pub fn list_vpn_profiles(&self, uid: u32) -> Result<Vec<String>> {
+        let mut path = self.path.clone();
+        let user_id = uid_to_android_user(uid);
+        path.push(format!("user_{}", user_id));
+        let uid_str = uid.to_string();
+        let dir =
+            Self::with_retry_interrupted(|| fs::read_dir(path.as_path())).with_context(|| {
+                format!("In list_vpn_profiles: Failed to open legacy blob database. {:?}", path)
+            })?;
+        let mut result: Vec<String> = Vec::new();
+        for entry in dir {
+            let file_name =
+                entry.context("In list_vpn_profiles: Trying to access dir entry")?.file_name();
+            if let Some(f) = file_name.to_str() {
+                let encoded_alias = &f[uid_str.len() + 1..];
+                if f.starts_with(&uid_str) && Self::is_vpn_profile(encoded_alias) {
+                    result.push(
+                        Self::decode_alias(encoded_alias)
+                            .context("In list_vpn_profiles: Trying to decode alias.")?,
+                    )
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// This function constructs the vpn_profile file name which has the form:
     /// user_<android user id>/<uid>_<alias>.
+    fn make_vpn_profile_filename(&self, uid: u32, alias: &str) -> Option<PathBuf> {
+        // legacy vpn entries must start with VPN_ or PLATFORM_VPN_ or are literally called
+        // LOCKDOWN_VPN.
+        if !Self::is_vpn_profile(alias) {
+            return None;
+        }
+
+        let mut path = self.path.clone();
+        let user_id = uid_to_android_user(uid);
+        let encoded_alias = Self::encode_alias(alias);
+        path.push(format!("user_{}", user_id));
+        path.push(format!("{}_{}", uid, encoded_alias));
+        Some(path)
+    }
+
+    /// This function constructs the blob file name which has the form:
+    /// user_<android user id>/<uid>_<prefix>_<alias>.
     fn make_blob_filename(&self, uid: u32, alias: &str, prefix: &str) -> PathBuf {
         let user_id = uid_to_android_user(uid);
         let encoded_alias = Self::encode_alias(&format!("{}_{}", prefix, alias));
@@ -721,6 +810,31 @@ impl LegacyBlobLoader {
                 result.push(f.to_string())
             }
         }
+        Ok(result)
+    }
+
+    /// List all keystore entries belonging to the given user. Returns a map of UIDs
+    /// to sets of decoded aliases.
+    pub fn list_keystore_entries_for_user(
+        &self,
+        user_id: u32,
+    ) -> Result<HashMap<u32, HashSet<String>>> {
+        let user_entries = self
+            .list_user(user_id)
+            .context("In list_keystore_entries_for_user: Trying to list user.")?;
+
+        let result =
+            user_entries.into_iter().fold(HashMap::<u32, HashSet<String>>::new(), |mut acc, v| {
+                if let Some(sep_pos) = v.find('_') {
+                    if let Ok(uid) = v[0..sep_pos].parse::<u32>() {
+                        if let Some(alias) = Self::extract_alias(&v[sep_pos + 1..]) {
+                            let entry = acc.entry(uid).or_default();
+                            entry.insert(alias);
+                        }
+                    }
+                }
+                acc
+            });
         Ok(result)
     }
 
@@ -812,16 +926,22 @@ impl LegacyBlobLoader {
 
         if something_was_deleted {
             let user_id = uid_to_android_user(uid);
-            if self
-                .is_empty_user(user_id)
-                .context("In remove_keystore_entry: Trying to check for empty user dir.")?
-            {
-                let user_path = self.make_user_path_name(user_id);
-                Self::with_retry_interrupted(|| fs::remove_dir(user_path.as_path())).ok();
-            }
+            self.remove_user_dir_if_empty(user_id)
+                .context("In remove_keystore_entry: Trying to remove empty user dir.")?;
         }
 
         Ok(something_was_deleted)
+    }
+
+    fn remove_user_dir_if_empty(&self, user_id: u32) -> Result<()> {
+        if self
+            .is_empty_user(user_id)
+            .context("In remove_user_dir_if_empty: Trying to check for empty user dir.")?
+        {
+            let user_path = self.make_user_path_name(user_id);
+            Self::with_retry_interrupted(|| fs::remove_dir(user_path.as_path())).ok();
+        }
+        Ok(())
     }
 
     /// Load a legacy key blob entry by uid and alias.
@@ -843,8 +963,7 @@ impl LegacyBlobLoader {
                             let decrypted = match key_manager
                                 .get_per_boot_key_by_user_id(uid_to_android_user(uid))
                             {
-                                Some(key) => aes_gcm_decrypt(data, iv, tag, &(key.get_key()))
-                                    .context(
+                                Some(key) => key.aes_gcm_decrypt(data, iv, tag).context(
                                     "In load_by_uid_alias: while trying to decrypt legacy blob.",
                                 )?,
                                 None => {
@@ -914,22 +1033,29 @@ impl LegacyBlobLoader {
     }
 
     /// Load and decrypt legacy super key blob.
-    pub fn load_super_key(&self, user_id: u32, pw: &[u8]) -> Result<Option<ZVec>> {
+    pub fn load_super_key(&self, user_id: u32, pw: &Password) -> Result<Option<ZVec>> {
         let path = self.make_super_key_filename(user_id);
         let blob = Self::read_generic_blob(&path)
             .context("In load_super_key: While loading super key.")?;
 
         let blob = match blob {
             Some(blob) => match blob {
-                Blob {
-                    value: BlobValue::PwEncrypted { iv, tag, data, salt, key_size }, ..
-                } => {
-                    let key = derive_key_from_password(pw, Some(&salt), key_size)
-                        .context("In load_super_key: Failed to derive key from password.")?;
-                    let blob = aes_gcm_decrypt(&data, &iv, &tag, &key).context(
-                        "In load_super_key: while trying to decrypt legacy super key blob.",
-                    )?;
-                    Some(blob)
+                Blob { flags, value: BlobValue::PwEncrypted { iv, tag, data, salt, key_size } } => {
+                    if (flags & flags::ENCRYPTED) != 0 {
+                        let key = pw
+                            .derive_key(Some(&salt), key_size)
+                            .context("In load_super_key: Failed to derive key from password.")?;
+                        let blob = aes_gcm_decrypt(&data, &iv, &tag, &key).context(
+                            "In load_super_key: while trying to decrypt legacy super key blob.",
+                        )?;
+                        Some(blob)
+                    } else {
+                        // In 2019 we had some unencrypted super keys due to b/141955555.
+                        Some(
+                            data.try_into()
+                                .context("In load_super_key: Trying to convert key into ZVec")?,
+                        )
+                    }
                 }
                 _ => {
                     return Err(KsError::Rc(ResponseCode::VALUE_CORRUPTED)).context(
@@ -1172,7 +1298,7 @@ mod test {
             Some(&error::Error::Rc(ResponseCode::LOCKED))
         );
 
-        key_manager.unlock_user_key(&mut db, 0, PASSWORD, &legacy_blob_loader)?;
+        key_manager.unlock_user_key(&mut db, 0, &(PASSWORD.into()), &legacy_blob_loader)?;
 
         if let (Some((Blob { flags, value: _ }, _params)), Some(cert), Some(chain)) =
             legacy_blob_loader.load_by_uid_alias(10223, "authbound", Some(&key_manager))?

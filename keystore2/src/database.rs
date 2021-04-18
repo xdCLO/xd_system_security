@@ -41,7 +41,6 @@
 //! from the database module these functions take permission check
 //! callbacks.
 
-use crate::error::{Error as KsError, ErrorCode, ResponseCode};
 use crate::impl_metadata; // This is in db_utils.rs
 use crate::key_parameter::{KeyParameter, Tag};
 use crate::permission::KeyPermSet;
@@ -49,6 +48,11 @@ use crate::utils::{get_current_time_in_seconds, AID_USER_OFFSET};
 use crate::{
     db_utils::{self, SqlField},
     gc::Gc,
+    super_key::USER_SUPER_KEY,
+};
+use crate::{
+    error::{Error as KsError, ErrorCode, ResponseCode},
+    super_key::SuperKeyType,
 };
 use anyhow::{anyhow, Context, Result};
 use std::{convert::TryFrom, convert::TryInto, ops::Deref, time::SystemTimeError};
@@ -108,6 +112,8 @@ impl_metadata!(
         /// Vector representing the raw public key so results from the server can be matched
         /// to the right entry
         AttestationRawPubKey(Vec<u8>) with accessor attestation_raw_pub_key,
+        /// SEC1 public key for ECDH encryption
+        Sec1PublicKey(Vec<u8>) with accessor sec1_public_key,
         //  --- ADD NEW META DATA FIELDS HERE ---
         // For backwards compatibility add new entries only to
         // end of this list and above this comment.
@@ -178,6 +184,8 @@ impl_metadata!(
         AeadTag(Vec<u8>) with accessor aead_tag,
         /// The uuid of the owning KeyMint instance.
         KmUuid(Uuid) with accessor km_uuid,
+        /// If the key is ECDH encrypted, this is the ephemeral public key
+        PublicKey(Vec<u8>) with accessor public_key,
         //  --- ADD NEW META DATA FIELDS HERE ---
         // For backwards compatibility add new entries only to
         // end of this list and above this comment.
@@ -581,10 +589,14 @@ impl CertificateInfo {
 
 /// This type represents a certificate chain with a private key corresponding to the leaf
 /// certificate. TODO(jbires): This will be used in a follow-on CL, for now it's used in the tests.
-#[allow(dead_code)]
 pub struct CertificateChain {
-    private_key: ZVec,
-    cert_chain: ZVec,
+    /// A KM key blob
+    pub private_key: ZVec,
+    /// A batch cert for private_key
+    pub batch_cert: Vec<u8>,
+    /// A full certificate chain from root signing authority to private_key, including batch_cert
+    /// for convenience.
+    pub cert_chain: Vec<u8>,
 }
 
 /// This type represents a Keystore 2.0 key entry.
@@ -729,9 +741,19 @@ impl MonotonicRawTime {
         Self(get_current_time_in_seconds())
     }
 
+    /// Constructs a new MonotonicRawTime from a given number of seconds.
+    pub fn from_secs(val: i64) -> Self {
+        Self(val)
+    }
+
     /// Returns the integer value of MonotonicRawTime as i64
     pub fn seconds(&self) -> i64 {
         self.0
+    }
+
+    /// Returns the value of MonotonicRawTime in milli seconds as i64
+    pub fn milli_seconds(&self) -> i64 {
+        self.0 * 1000
     }
 
     /// Like i64::checked_sub.
@@ -786,6 +808,11 @@ impl AuthTokenEntry {
     pub fn time_received(&self) -> MonotonicRawTime {
         self.time_received
     }
+
+    /// Returns the challenge value of the auth token.
+    pub fn challenge(&self) -> i64 {
+        self.auth_token.challenge
+    }
 }
 
 /// Shared in-memory databases get destroyed as soon as the last connection to them gets closed.
@@ -794,10 +821,8 @@ impl AuthTokenEntry {
 pub struct PerBootDbKeepAlive(Connection);
 
 impl KeystoreDB {
+    const UNASSIGNED_KEY_ID: i64 = -1i64;
     const PERBOOT_DB_FILE_NAME: &'static str = &"file:perboot.sqlite?mode=memory&cache=shared";
-
-    /// The alias of the user super key.
-    pub const USER_SUPER_KEY_ALIAS: &'static str = &"USER_SUPER_KEY";
 
     /// This creates a PerBootDbKeepAlive object to keep the per boot database alive.
     pub fn keep_perboot_db_alive() -> Result<PerBootDbKeepAlive> {
@@ -1129,7 +1154,10 @@ impl KeystoreDB {
     pub fn store_super_key(
         &mut self,
         user_id: u32,
-        blob_info: &(&[u8], &BlobMetaData),
+        key_type: &SuperKeyType,
+        blob: &[u8],
+        blob_metadata: &BlobMetaData,
+        key_metadata: &KeyMetaData,
     ) -> Result<KeyEntry> {
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
             let key_id = Self::insert_with_retry(|id| {
@@ -1142,7 +1170,7 @@ impl KeystoreDB {
                         KeyType::Super,
                         Domain::APP.0,
                         user_id as i64,
-                        Self::USER_SUPER_KEY_ALIAS,
+                        key_type.alias,
                         KeyLifeCycle::Live,
                         &KEYSTORE_UUID,
                     ],
@@ -1150,7 +1178,8 @@ impl KeystoreDB {
             })
             .context("Failed to insert into keyentry table.")?;
 
-            let (blob, blob_metadata) = *blob_info;
+            key_metadata.store_in_db(key_id, tx).context("KeyMetaData::store_in_db failed")?;
+
             Self::set_blob_internal(
                 &tx,
                 key_id,
@@ -1168,12 +1197,16 @@ impl KeystoreDB {
     }
 
     /// Loads super key of a given user, if exists
-    pub fn load_super_key(&mut self, user_id: u32) -> Result<Option<(KeyIdGuard, KeyEntry)>> {
+    pub fn load_super_key(
+        &mut self,
+        key_type: &SuperKeyType,
+        user_id: u32,
+    ) -> Result<Option<(KeyIdGuard, KeyEntry)>> {
         self.with_transaction(TransactionBehavior::Immediate, |tx| {
             let key_descriptor = KeyDescriptor {
                 domain: Domain::APP,
                 nspace: user_id as i64,
-                alias: Some(String::from("USER_SUPER_KEY")),
+                alias: Some(key_type.alias.into()),
                 blob: None,
             };
             let id = Self::load_key_entry_id(&tx, &key_descriptor, KeyType::Super);
@@ -1269,7 +1302,7 @@ impl KeystoreDB {
                         Some(&blob),
                         Some(&metadata),
                     )
-                    .context("In get_of_create_key_with.")?;
+                    .context("In get_or_create_key_with.")?;
                     (
                         id,
                         KeyEntry {
@@ -1337,15 +1370,11 @@ impl KeystoreDB {
     }
 
     fn is_locked_error(e: &anyhow::Error) -> bool {
-        matches!(e.root_cause().downcast_ref::<rusqlite::ffi::Error>(),
-        Some(rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DatabaseBusy,
-            ..
-        })
-        | Some(rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::DatabaseLocked,
-            ..
-        }))
+        matches!(
+            e.root_cause().downcast_ref::<rusqlite::ffi::Error>(),
+            Some(rusqlite::ffi::Error { code: rusqlite::ErrorCode::DatabaseBusy, .. })
+                | Some(rusqlite::ffi::Error { code: rusqlite::ErrorCode::DatabaseLocked, .. })
+        )
     }
 
     /// Creates a new key entry and allocates a new randomized id for the new key.
@@ -1459,6 +1488,24 @@ impl KeystoreDB {
         .context("In set_blob.")
     }
 
+    /// Why would we insert a deleted blob? This weird function is for the purpose of legacy
+    /// key migration in the case where we bulk delete all the keys of an app or even a user.
+    /// We use this to insert key blobs into the database which can then be garbage collected
+    /// lazily by the key garbage collector.
+    pub fn set_deleted_blob(&mut self, blob: &[u8], blob_metadata: &BlobMetaData) -> Result<()> {
+        self.with_transaction(TransactionBehavior::Immediate, |tx| {
+            Self::set_blob_internal(
+                &tx,
+                Self::UNASSIGNED_KEY_ID,
+                SubComponentType::KEY_BLOB,
+                Some(blob),
+                Some(blob_metadata),
+            )
+            .need_gc()
+        })
+        .context("In set_deleted_blob.")
+    }
+
     fn set_blob_internal(
         tx: &Transaction,
         key_id: i64,
@@ -1551,6 +1598,7 @@ impl KeystoreDB {
     pub fn store_signed_attestation_certificate_chain(
         &mut self,
         raw_public_key: &[u8],
+        batch_cert: &[u8],
         cert_chain: &[u8],
         expiration_date: i64,
         km_uuid: &Uuid,
@@ -1609,6 +1657,8 @@ impl KeystoreDB {
                 None,
             )
             .context("Failed to insert cert chain")?;
+            Self::set_blob_internal(&tx, key_id, SubComponentType::CERT, Some(batch_cert), None)
+                .context("Failed to insert cert")?;
             Ok(()).no_gc()
         })
         .context("In store_signed_attestation_certificate_chain: ")
@@ -1665,11 +1715,11 @@ impl KeystoreDB {
                     ],
                 )
                 .context("Failed to assign attestation key")?;
-            if result != 1 {
-                return Err(KsError::sys()).context(format!(
-                    "Expected to update a single entry but instead updated {}.",
-                    result
-                ));
+            if result == 0 {
+                return Err(KsError::Rc(ResponseCode::OUT_OF_KEYS)).context("Out of keys.");
+            } else if result > 1 {
+                return Err(KsError::sys())
+                    .context(format!("Expected to update 1 entry, instead updated {}", result));
             }
             Ok(()).no_gc()
         })
@@ -1751,6 +1801,33 @@ impl KeystoreDB {
             Ok(num_deleted).do_gc(num_deleted != 0)
         })
         .context("In delete_expired_attestation_keys: ")
+    }
+
+    /// Deletes all remotely provisioned attestation keys in the system, regardless of the state
+    /// they are in. This is useful primarily as a testing mechanism.
+    pub fn delete_all_attestation_keys(&mut self) -> Result<i64> {
+        self.with_transaction(TransactionBehavior::Immediate, |tx| {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM persistent.keyentry
+                    WHERE key_type IS ?;",
+                )
+                .context("Failed to prepare statement")?;
+            let keys_to_delete = stmt
+                .query_map(params![KeyType::Attestation], |row| Ok(row.get(0)?))?
+                .collect::<rusqlite::Result<Vec<i64>>>()
+                .context("Failed to execute statement")?;
+            let num_deleted = keys_to_delete
+                .iter()
+                .map(|id| Self::mark_unreferenced(&tx, *id))
+                .collect::<Result<Vec<bool>>>()
+                .context("Failed to execute mark_unreferenced on a keyid")?
+                .into_iter()
+                .filter(|result| *result)
+                .count() as i64;
+            Ok(num_deleted).do_gc(num_deleted != 0)
+        })
+        .context("In delete_all_attestation_keys: ")
     }
 
     /// Counts the number of keys that will expire by the provided epoch date and the number of
@@ -1859,19 +1936,21 @@ impl KeystoreDB {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?
                 .collect::<rusqlite::Result<Vec<(SubComponentType, Vec<u8>)>>>()
-                .context("In retrieve_attestation_key_and_cert_chain: query failed.")?;
+                .context("query failed.")?;
             if rows.is_empty() {
                 return Ok(None).no_gc();
-            } else if rows.len() != 2 {
+            } else if rows.len() != 3 {
                 return Err(KsError::sys()).context(format!(
                     concat!(
-                "In retrieve_attestation_key_and_cert_chain: Expected to get a single attestation",
-                "key chain but instead got {}."),
+                        "Expected to get a single attestation",
+                        "key, cert, and cert chain for a total of 3 entries, but instead got {}."
+                    ),
                     rows.len()
                 ));
             }
             let mut km_blob: Vec<u8> = Vec::new();
             let mut cert_chain_blob: Vec<u8> = Vec::new();
+            let mut batch_cert_blob: Vec<u8> = Vec::new();
             for row in rows {
                 let sub_type: SubComponentType = row.0;
                 match sub_type {
@@ -1881,15 +1960,20 @@ impl KeystoreDB {
                     SubComponentType::CERT_CHAIN => {
                         cert_chain_blob = row.1;
                     }
+                    SubComponentType::CERT => {
+                        batch_cert_blob = row.1;
+                    }
                     _ => Err(KsError::sys()).context("Unknown or incorrect subcomponent type.")?,
                 }
             }
             Ok(Some(CertificateChain {
                 private_key: ZVec::try_from(km_blob)?,
-                cert_chain: ZVec::try_from(cert_chain_blob)?,
+                batch_cert: batch_cert_blob,
+                cert_chain: cert_chain_blob,
             }))
             .no_gc()
         })
+        .context("In retrieve_attestation_key_and_cert_chain:")
     }
 
     /// Updates the alias column of the given key id `newid` with the given alias,
@@ -2492,6 +2576,51 @@ impl KeystoreDB {
         .context("In get_key_km_uuid.")
     }
 
+    /// Delete all artifacts belonging to the namespace given by the domain-namespace tuple.
+    /// This leaves all of the blob entries orphaned for subsequent garbage collection.
+    pub fn unbind_keys_for_namespace(&mut self, domain: Domain, namespace: i64) -> Result<()> {
+        if !(domain == Domain::APP || domain == Domain::SELINUX) {
+            return Err(KsError::Rc(ResponseCode::INVALID_ARGUMENT))
+                .context("In unbind_keys_for_namespace.");
+        }
+        self.with_transaction(TransactionBehavior::Immediate, |tx| {
+            tx.execute(
+                "DELETE FROM persistent.keymetadata
+                WHERE keyentryid IN (
+                    SELECT id FROM persistent.keyentry
+                    WHERE domain = ? AND namespace = ?
+                );",
+                params![domain.0, namespace],
+            )
+            .context("Trying to delete keymetadata.")?;
+            tx.execute(
+                "DELETE FROM persistent.keyparameter
+                WHERE keyentryid IN (
+                    SELECT id FROM persistent.keyentry
+                    WHERE domain = ? AND namespace = ?
+                );",
+                params![domain.0, namespace],
+            )
+            .context("Trying to delete keyparameters.")?;
+            tx.execute(
+                "DELETE FROM persistent.grant
+                WHERE keyentryid IN (
+                    SELECT id FROM persistent.keyentry
+                    WHERE domain = ? AND namespace = ?
+                );",
+                params![domain.0, namespace],
+            )
+            .context("Trying to delete grants.")?;
+            tx.execute(
+                "DELETE FROM persistent.keyentry WHERE domain = ? AND namespace = ?;",
+                params![domain.0, namespace],
+            )
+            .context("Trying to delete keyentry.")?;
+            Ok(()).need_gc()
+        })
+        .context("In unbind_keys_for_namespace")
+    }
+
     /// Delete the keys created on behalf of the user, denoted by the user id.
     /// Delete all the keys unless 'keep_non_super_encrypted_keys' set to true.
     /// Returned boolean is to hint the garbage collector to delete the unbound keys.
@@ -2533,7 +2662,7 @@ impl KeystoreDB {
                     // OR super key:
                     KeyType::Super,
                     user_id,
-                    Self::USER_SUPER_KEY_ALIAS,
+                    USER_SUPER_KEY.alias,
                     KeyLifeCycle::Live
                 ])
                 .context("In unbind_keys_for_user. Failed to query the keys created by apps.")?;
@@ -2735,7 +2864,10 @@ impl KeystoreDB {
     // otherwise return the id.
     fn insert_with_retry(inserter: impl Fn(i64) -> rusqlite::Result<usize>) -> Result<i64> {
         loop {
-            let newid: i64 = random();
+            let newid: i64 = match random() {
+                Self::UNASSIGNED_KEY_ID => continue, // UNASSIGNED_KEY_ID cannot be assigned.
+                i => i,
+            };
             match inserter(newid) {
                 // If the id already existed, try again.
                 Err(rusqlite::Error::SqliteFailure(
@@ -3133,8 +3265,9 @@ mod tests {
             db.retrieve_attestation_key_and_cert_chain(Domain::APP, namespace, &KEYSTORE_UUID)?;
         assert_eq!(true, chain.is_some());
         let cert_chain = chain.unwrap();
-        assert_eq!(cert_chain.private_key.to_vec(), loaded_values[2]);
-        assert_eq!(cert_chain.cert_chain.to_vec(), loaded_values[1]);
+        assert_eq!(cert_chain.private_key.to_vec(), loaded_values.priv_key);
+        assert_eq!(cert_chain.batch_cert, loaded_values.batch_cert);
+        assert_eq!(cert_chain.cert_chain, loaded_values.cert_chain);
         Ok(())
     }
 
@@ -3169,6 +3302,7 @@ mod tests {
         let private_key: Vec<u8> = vec![0x04, 0x05, 0x06];
         let raw_public_key: Vec<u8> = vec![0x07, 0x08, 0x09];
         let cert_chain: Vec<u8> = vec![0x0a, 0x0b, 0x0c];
+        let batch_cert: Vec<u8> = vec![0x0d, 0x0e, 0x0f];
         db.create_attestation_key_entry(
             &public_key,
             &raw_public_key,
@@ -3181,6 +3315,7 @@ mod tests {
         assert_eq!(status.total, 4);
         db.store_signed_attestation_certificate_chain(
             &raw_public_key,
+            &batch_cert,
             &cert_chain,
             20,
             &KEYSTORE_UUID,
@@ -3215,9 +3350,9 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(id) FROM persistent.blobentry;", NO_PARAMS, |row| row.get(0))
             .expect("Failed to get blob entry row count.");
-        // We expect 6 rows here because there are two blobs per attestation key, i.e.,
-        // One key and one certificate.
-        assert_eq!(blob_entry_row_count, 6);
+        // We expect 9 rows here because there are three blobs per attestation key, i.e.,
+        // one key, one certificate chain, and one certificate.
+        assert_eq!(blob_entry_row_count, 9);
 
         assert_eq!(db.delete_expired_attestation_keys()?, 2);
 
@@ -3225,8 +3360,9 @@ mod tests {
             db.retrieve_attestation_key_and_cert_chain(Domain::APP, namespace, &KEYSTORE_UUID)?;
         assert!(cert_chain.is_some());
         let value = cert_chain.unwrap();
-        assert_eq!(entry_values[1], value.cert_chain.to_vec());
-        assert_eq!(entry_values[2], value.private_key.to_vec());
+        assert_eq!(entry_values.batch_cert, value.batch_cert);
+        assert_eq!(entry_values.cert_chain, value.cert_chain);
+        assert_eq!(entry_values.priv_key, value.private_key.to_vec());
 
         cert_chain = db.retrieve_attestation_key_and_cert_chain(
             Domain::APP,
@@ -3248,9 +3384,26 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(id) FROM persistent.blobentry;", NO_PARAMS, |row| row.get(0))
             .expect("Failed to get blob entry row count.");
-        // There shound be 2 blob entries left, because we deleted two of the attestation
-        // key entries with two blobs each.
-        assert_eq!(blob_entry_row_count, 2);
+        // There shound be 3 blob entries left, because we deleted two of the attestation
+        // key entries with three blobs each.
+        assert_eq!(blob_entry_row_count, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_all_attestation_keys() -> Result<()> {
+        let mut db = new_test_db()?;
+        load_attestation_key_pool(&mut db, 45 /* expiration */, 1 /* namespace */, 0x02)?;
+        load_attestation_key_pool(&mut db, 80 /* expiration */, 2 /* namespace */, 0x03)?;
+        db.create_key_entry(&Domain::APP, &42, &KEYSTORE_UUID)?;
+        let result = db.delete_all_attestation_keys()?;
+
+        // Give the garbage collector half a second to catch up.
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Attestation keys should be deleted, and the regular key should remain.
+        assert_eq!(result, 2);
 
         Ok(())
     }
@@ -4291,7 +4444,6 @@ mod tests {
     }
 
     #[derive(Debug, PartialEq)]
-    #[allow(dead_code)]
     struct KeyEntryRow {
         id: i64,
         key_type: KeyType,
@@ -4323,30 +4475,33 @@ mod tests {
             .collect::<Result<Vec<_>>>()
     }
 
+    struct RemoteProvValues {
+        cert_chain: Vec<u8>,
+        priv_key: Vec<u8>,
+        batch_cert: Vec<u8>,
+    }
+
     fn load_attestation_key_pool(
         db: &mut KeystoreDB,
         expiration_date: i64,
         namespace: i64,
         base_byte: u8,
-    ) -> Result<Vec<Vec<u8>>> {
-        let mut chain: Vec<Vec<u8>> = Vec::new();
+    ) -> Result<RemoteProvValues> {
         let public_key: Vec<u8> = vec![base_byte, 0x02 * base_byte];
         let cert_chain: Vec<u8> = vec![0x03 * base_byte, 0x04 * base_byte];
         let priv_key: Vec<u8> = vec![0x05 * base_byte, 0x06 * base_byte];
         let raw_public_key: Vec<u8> = vec![0x0b * base_byte, 0x0c * base_byte];
+        let batch_cert: Vec<u8> = vec![base_byte * 0x0d, base_byte * 0x0e];
         db.create_attestation_key_entry(&public_key, &raw_public_key, &priv_key, &KEYSTORE_UUID)?;
         db.store_signed_attestation_certificate_chain(
             &raw_public_key,
+            &batch_cert,
             &cert_chain,
             expiration_date,
             &KEYSTORE_UUID,
         )?;
         db.assign_attestation_key(Domain::APP, namespace, &KEYSTORE_UUID)?;
-        chain.push(public_key);
-        chain.push(cert_chain);
-        chain.push(priv_key);
-        chain.push(raw_public_key);
-        Ok(chain)
+        Ok(RemoteProvValues { cert_chain, priv_key, batch_cert })
     }
 
     // Note: The parameters and SecurityLevel associations are nonsensical. This
@@ -4742,31 +4897,36 @@ mod tests {
     #[test]
     fn test_store_super_key() -> Result<()> {
         let mut db = new_test_db()?;
-        let pw = "xyzabc".as_bytes();
+        let pw: keystore2_crypto::Password = (&b"xyzabc"[..]).into();
         let super_key = keystore2_crypto::generate_aes256_key()?;
-        let secret = String::from("keystore2 is great.");
-        let secret_bytes = secret.into_bytes();
+        let secret_bytes = b"keystore2 is great.";
         let (encrypted_secret, iv, tag) =
-            keystore2_crypto::aes_gcm_encrypt(&secret_bytes, &super_key)?;
+            keystore2_crypto::aes_gcm_encrypt(secret_bytes, &super_key)?;
 
         let (encrypted_super_key, metadata) =
             SuperKeyManager::encrypt_with_password(&super_key, &pw)?;
-        db.store_super_key(1, &(&encrypted_super_key, &metadata))?;
+        db.store_super_key(
+            1,
+            &USER_SUPER_KEY,
+            &encrypted_super_key,
+            &metadata,
+            &KeyMetaData::new(),
+        )?;
 
         //check if super key exists
-        assert!(db.key_exists(Domain::APP, 1, "USER_SUPER_KEY", KeyType::Super)?);
+        assert!(db.key_exists(Domain::APP, 1, &USER_SUPER_KEY.alias, KeyType::Super)?);
 
-        let (_, key_entry) = db.load_super_key(1)?.unwrap();
-        let loaded_super_key = SuperKeyManager::extract_super_key_from_key_entry(key_entry, &pw)?;
-
-        let decrypted_secret_bytes = keystore2_crypto::aes_gcm_decrypt(
-            &encrypted_secret,
-            &iv,
-            &tag,
-            &loaded_super_key.get_key(),
+        let (_, key_entry) = db.load_super_key(&USER_SUPER_KEY, 1)?.unwrap();
+        let loaded_super_key = SuperKeyManager::extract_super_key_from_key_entry(
+            USER_SUPER_KEY.algorithm,
+            key_entry,
+            &pw,
+            None,
         )?;
-        let decrypted_secret = String::from_utf8((&decrypted_secret_bytes).to_vec())?;
-        assert_eq!(String::from("keystore2 is great."), decrypted_secret);
+
+        let decrypted_secret_bytes =
+            loaded_super_key.aes_gcm_decrypt(&encrypted_secret, &iv, &tag)?;
+        assert_eq!(secret_bytes, &*decrypted_secret_bytes);
         Ok(())
     }
 }
