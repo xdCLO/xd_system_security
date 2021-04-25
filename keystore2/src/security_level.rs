@@ -22,10 +22,11 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
     KeyMintHardwareInfo::KeyMintHardwareInfo, KeyParameter::KeyParameter,
     KeyParameterValue::KeyParameterValue, SecurityLevel::SecurityLevel, Tag::Tag,
 };
+use android_hardware_security_keymint::binder::{BinderFeatures, Strong, ThreadState};
 use android_system_keystore2::aidl::android::system::keystore2::{
     AuthenticatorSpec::AuthenticatorSpec, CreateOperationResponse::CreateOperationResponse,
-    Domain::Domain, IKeystoreOperation::IKeystoreOperation,
-    IKeystoreSecurityLevel::BnKeystoreSecurityLevel,
+    Domain::Domain, EphemeralStorageKeyResponse::EphemeralStorageKeyResponse,
+    IKeystoreOperation::IKeystoreOperation, IKeystoreSecurityLevel::BnKeystoreSecurityLevel,
     IKeystoreSecurityLevel::IKeystoreSecurityLevel, KeyDescriptor::KeyDescriptor,
     KeyMetadata::KeyMetadata, KeyParameters::KeyParameters,
 };
@@ -57,7 +58,6 @@ use crate::{
     utils::key_characteristics_to_internal,
 };
 use anyhow::{anyhow, Context, Result};
-use binder::{IBinderInternal, Strong, ThreadState};
 
 /// Implementation of the IKeystoreSecurityLevel Interface.
 pub struct KeystoreSecurityLevel {
@@ -79,8 +79,8 @@ const UNDEFINED_NOT_AFTER: i64 = 253402300799000i64;
 
 impl KeystoreSecurityLevel {
     /// Creates a new security level instance wrapped in a
-    /// BnKeystoreSecurityLevel proxy object. It also
-    /// calls `IBinderInternal::set_requesting_sid` on the new interface, because
+    /// BnKeystoreSecurityLevel proxy object. It also enables
+    /// `BinderFeatures::set_requesting_sid` on the new interface, because
     /// we need it for checking keystore permissions.
     pub fn new_native_binder(
         security_level: SecurityLevel,
@@ -88,16 +88,18 @@ impl KeystoreSecurityLevel {
     ) -> Result<(Strong<dyn IKeystoreSecurityLevel>, Uuid)> {
         let (dev, hw_info, km_uuid) = get_keymint_device(&security_level)
             .context("In KeystoreSecurityLevel::new_native_binder.")?;
-        let result = BnKeystoreSecurityLevel::new_binder(Self {
-            security_level,
-            keymint: dev,
-            hw_info,
-            km_uuid,
-            operation_db: OperationDb::new(),
-            rem_prov_state: RemProvState::new(security_level, km_uuid),
-            id_rotation_state,
-        });
-        result.as_binder().set_requesting_sid(true);
+        let result = BnKeystoreSecurityLevel::new_binder(
+            Self {
+                security_level,
+                keymint: dev,
+                hw_info,
+                km_uuid,
+                operation_db: OperationDb::new(),
+                rem_prov_state: RemProvState::new(security_level, km_uuid),
+                id_rotation_state,
+            },
+            BinderFeatures { set_requesting_sid: true, ..BinderFeatures::default() },
+        );
         Ok((result, km_uuid))
     }
 
@@ -277,6 +279,12 @@ impl KeystoreSecurityLevel {
                     .context("In create_operation: Malformed KeyParameter."),
             },
         )?;
+
+        // Remove Tag::PURPOSE from the operation_parameters, since some keymaster devices return
+        // an error on begin() if Tag::PURPOSE is in the operation_parameters.
+        let op_params: Vec<KeyParameter> =
+            operation_parameters.iter().filter(|p| p.tag != Tag::PURPOSE).cloned().collect();
+        let operation_parameters = op_params.as_slice();
 
         let (immediate_hat, mut auth_info) = ENFORCEMENTS
             .authorize_create(
@@ -701,7 +709,7 @@ impl KeystoreSecurityLevel {
             SuperKeyManager::reencrypt_if_required(key_blob, &upgraded_blob)
                 .context("In store_upgraded_keyblob: Failed to handle super encryption.")?;
 
-        let mut new_blob_metadata = new_blob_metadata.unwrap_or_else(BlobMetaData::new);
+        let mut new_blob_metadata = new_blob_metadata.unwrap_or_default();
         if let Some(uuid) = km_uuid {
             new_blob_metadata.add(BlobMetaEntry::KmUuid(*uuid));
         }
@@ -777,7 +785,10 @@ impl KeystoreSecurityLevel {
         }
     }
 
-    fn convert_storage_key_to_ephemeral(&self, storage_key: &KeyDescriptor) -> Result<Vec<u8>> {
+    fn convert_storage_key_to_ephemeral(
+        &self,
+        storage_key: &KeyDescriptor,
+    ) -> Result<EphemeralStorageKeyResponse> {
         if storage_key.domain != Domain::BLOB {
             return Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT)).context(concat!(
                 "In IKeystoreSecurityLevel convert_storage_key_to_ephemeral: ",
@@ -800,8 +811,26 @@ impl KeystoreSecurityLevel {
             "In IKeystoreSecurityLevel convert_storage_key_to_ephemeral: ",
             "Getting keymint device interface"
         ))?;
-        map_km_error(km_dev.convertStorageKeyToEphemeral(key_blob))
-            .context("In keymint device convertStorageKeyToEphemeral")
+        match map_km_error(km_dev.convertStorageKeyToEphemeral(key_blob)) {
+            Ok(result) => {
+                Ok(EphemeralStorageKeyResponse { ephemeralKey: result, upgradedBlob: None })
+            }
+            Err(error::Error::Km(ErrorCode::KEY_REQUIRES_UPGRADE)) => {
+                let upgraded_blob = map_km_error(km_dev.upgradeKey(key_blob, &[]))
+                    .context("In convert_storage_key_to_ephemeral: Failed to upgrade key blob.")?;
+                let ephemeral_key = map_km_error(km_dev.convertStorageKeyToEphemeral(key_blob))
+                    .context(concat!(
+                        "In convert_storage_key_to_ephemeral: ",
+                        "Failed to retrieve ephemeral key (after upgrade)."
+                    ))?;
+                Ok(EphemeralStorageKeyResponse {
+                    ephemeralKey: ephemeral_key,
+                    upgradedBlob: Some(upgraded_blob),
+                })
+            }
+            Err(e) => Err(e)
+                .context("In convert_storage_key_to_ephemeral: Failed to retrieve ephemeral key."),
+        }
     }
 
     fn delete_key(&self, key: &KeyDescriptor) -> Result<()> {
@@ -878,7 +907,7 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
     fn convertStorageKeyToEphemeral(
         &self,
         storage_key: &KeyDescriptor,
-    ) -> binder::public_api::Result<Vec<u8>> {
+    ) -> binder::public_api::Result<EphemeralStorageKeyResponse> {
         map_or_log_err(self.convert_storage_key_to_ephemeral(storage_key), Ok)
     }
     fn deleteKey(&self, key: &KeyDescriptor) -> binder::public_api::Result<()> {
