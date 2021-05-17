@@ -19,6 +19,8 @@
 //! certificate chains signed by some root authority and stored in a keystore SQLite
 //! DB.
 
+#![allow(clippy::from_over_into, clippy::needless_question_mark, clippy::vec_init_then_push)]
+
 use std::collections::HashMap;
 
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
@@ -32,7 +34,7 @@ use android_security_remoteprovisioning::aidl::android::security::remoteprovisio
     AttestationPoolStatus::AttestationPoolStatus, IRemoteProvisioning::BnRemoteProvisioning,
     IRemoteProvisioning::IRemoteProvisioning,
 };
-use android_security_remoteprovisioning::binder::Strong;
+use android_security_remoteprovisioning::binder::{BinderFeatures, Strong};
 use android_system_keystore2::aidl::android::system::keystore2::{
     Domain::Domain, KeyDescriptor::KeyDescriptor,
 };
@@ -231,7 +233,7 @@ impl RemoteProvisioningService {
         if let Ok(dev) = get_remotely_provisioned_component(&SecurityLevel::STRONGBOX) {
             result.device_by_sec_level.insert(SecurityLevel::STRONGBOX, dev);
         }
-        Ok(BnRemoteProvisioning::new_binder(result))
+        Ok(BnRemoteProvisioning::new_binder(result, BinderFeatures::default()))
     }
 
     /// Populates the AttestationPoolStatus parcelable with information about how many

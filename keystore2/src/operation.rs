@@ -131,12 +131,13 @@ use crate::metrics::log_key_operation_event_stats;
 use crate::utils::Asp;
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     IKeyMintOperation::IKeyMintOperation, KeyParameter::KeyParameter, KeyPurpose::KeyPurpose,
+    SecurityLevel::SecurityLevel,
 };
+use android_hardware_security_keymint::binder::BinderFeatures;
 use android_system_keystore2::aidl::android::system::keystore2::{
     IKeystoreOperation::BnKeystoreOperation, IKeystoreOperation::IKeystoreOperation,
 };
 use anyhow::{anyhow, Context, Result};
-use binder::IBinderInternal;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, Weak},
@@ -181,6 +182,7 @@ pub struct Operation {
 /// Keeps track of the information required for logging operations.
 #[derive(Debug)]
 pub struct LoggingInfo {
+    sec_level: SecurityLevel,
     purpose: KeyPurpose,
     op_params: Vec<KeyParameter>,
     key_upgraded: bool,
@@ -189,11 +191,12 @@ pub struct LoggingInfo {
 impl LoggingInfo {
     /// Constructor
     pub fn new(
+        sec_level: SecurityLevel,
         purpose: KeyPurpose,
         op_params: Vec<KeyParameter>,
         key_upgraded: bool,
     ) -> LoggingInfo {
-        Self { purpose, op_params, key_upgraded }
+        Self { sec_level, purpose, op_params, key_upgraded }
     }
 }
 
@@ -468,6 +471,7 @@ impl Drop for Operation {
     fn drop(&mut self) {
         let guard = self.outcome.lock().expect("In drop.");
         log_key_operation_event_stats(
+            self.logging_info.sec_level,
             self.logging_info.purpose,
             &(self.logging_info.op_params),
             &guard,
@@ -779,16 +783,16 @@ pub struct KeystoreOperation {
 
 impl KeystoreOperation {
     /// Creates a new operation instance wrapped in a
-    /// BnKeystoreOperation proxy object. It also
-    /// calls `IBinderInternal::set_requesting_sid` on the new interface, because
+    /// BnKeystoreOperation proxy object. It also enables
+    /// `BinderFeatures::set_requesting_sid` on the new interface, because
     /// we need it for checking Keystore permissions.
     pub fn new_native_binder(
         operation: Arc<Operation>,
     ) -> binder::public_api::Strong<dyn IKeystoreOperation> {
-        let result =
-            BnKeystoreOperation::new_binder(Self { operation: Mutex::new(Some(operation)) });
-        result.as_binder().set_requesting_sid(true);
-        result
+        BnKeystoreOperation::new_binder(
+            Self { operation: Mutex::new(Some(operation)) },
+            BinderFeatures { set_requesting_sid: true, ..BinderFeatures::default() },
+        )
     }
 
     /// Grabs the outer operation mutex and calls `f` on the locked operation.
