@@ -36,7 +36,6 @@ use keystore2_apc_compat::{
     APC_COMPAT_ERROR_IGNORED, APC_COMPAT_ERROR_OK, APC_COMPAT_ERROR_OPERATION_PENDING,
     APC_COMPAT_ERROR_SYSTEM_ERROR,
 };
-use std::convert::TryFrom;
 use std::sync::Mutex;
 
 /// This function uses its namesake in the permission module and in
@@ -107,11 +106,17 @@ pub fn check_device_attestation_permissions() -> anyhow::Result<()> {
     let permission_controller: binder::Strong<dyn IPermissionController::IPermissionController> =
         binder::get_interface("permission")?;
 
-    let binder_result = permission_controller.checkPermission(
-        "android.permission.READ_PRIVILEGED_PHONE_STATE",
-        ThreadState::get_calling_pid(),
-        ThreadState::get_calling_uid() as i32,
-    );
+    let binder_result = {
+        let _wp = watchdog::watch_millis(
+            "In check_device_attestation_permissions: calling checkPermission.",
+            500,
+        );
+        permission_controller.checkPermission(
+            "android.permission.READ_PRIVILEGED_PHONE_STATE",
+            ThreadState::get_calling_pid(),
+            ThreadState::get_calling_uid() as i32,
+        )
+    };
     let has_permissions = map_binder_status(binder_result)
         .context("In check_device_attestation_permissions: checkPermission failed")?;
     match has_permissions {
@@ -191,8 +196,7 @@ pub fn get_current_time_in_seconds() -> i64 {
     // defined to be an error that can never happen (i.e. the result is always ok).
     // This suppresses the compiler's complaint about converting tv_sec to i64 in method
     // get_current_time_in_seconds.
-    #[allow(clippy::useless_conversion)]
-    i64::try_from(current_time.tv_sec).unwrap()
+    current_time.tv_sec as i64
 }
 
 /// Converts a response code as returned by the Android Protected Confirmation HIDL compatibility
@@ -231,6 +235,55 @@ pub const AID_KEYSTORE: u32 = cutils_bindgen::AID_KEYSTORE;
 pub fn uid_to_android_user(uid: u32) -> u32 {
     // Safety: No memory access
     unsafe { cutils_bindgen::multiuser_get_user_id(uid) }
+}
+
+/// This module provides helpers for simplified use of the watchdog module.
+#[cfg(feature = "watchdog")]
+pub mod watchdog {
+    pub use crate::watchdog::WatchPoint;
+    use crate::watchdog::Watchdog;
+    use lazy_static::lazy_static;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    lazy_static! {
+        /// A Watchdog thread, that can be used to create watch points.
+        static ref WD: Arc<Watchdog> = Watchdog::new(Duration::from_secs(10));
+    }
+
+    /// Sets a watch point with `id` and a timeout of `millis` milliseconds.
+    pub fn watch_millis(id: &'static str, millis: u64) -> Option<WatchPoint> {
+        Watchdog::watch(&WD, id, Duration::from_millis(millis))
+    }
+
+    /// Like `watch_millis` but with a callback that is called every time a report
+    /// is printed about this watch point.
+    pub fn watch_millis_with(
+        id: &'static str,
+        millis: u64,
+        callback: impl Fn() -> String + Send + 'static,
+    ) -> Option<WatchPoint> {
+        Watchdog::watch_with(&WD, id, Duration::from_millis(millis), callback)
+    }
+}
+
+/// This module provides empty/noop implementations of the watch dog utility functions.
+#[cfg(not(feature = "watchdog"))]
+pub mod watchdog {
+    /// Noop watch point.
+    pub struct WatchPoint();
+    /// Sets a Noop watch point.
+    fn watch_millis(_: &'static str, _: u64) -> Option<WatchPoint> {
+        None
+    }
+
+    pub fn watch_millis_with(
+        _: &'static str,
+        _: u64,
+        _: impl Fn() -> String + Send + 'static,
+    ) -> Option<WatchPoint> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -14,8 +14,6 @@
 
 //! This module implements methods to load legacy keystore key blob files.
 
-#![allow(clippy::redundant_slicing)]
-
 use crate::{
     error::{Error as KsError, ResponseCode},
     key_parameter::{KeyParameter, KeyParameterValue},
@@ -206,7 +204,7 @@ impl Blob {
 }
 
 impl LegacyBlobLoader {
-    const IV_SIZE: usize = keystore2_crypto::IV_LENGTH;
+    const IV_SIZE: usize = keystore2_crypto::LEGACY_IV_LENGTH;
     const GCM_TAG_LENGTH: usize = keystore2_crypto::TAG_LENGTH;
     const SALT_SIZE: usize = keystore2_crypto::SALT_LENGTH;
 
@@ -484,15 +482,13 @@ impl LegacyBlobLoader {
         let element_size =
             read_ne_u32(stream).context("In read_key_parameters: While reading element size.")?;
 
-        let elements_buffer = stream
+        let mut element_stream = stream
             .get(0..element_size as usize)
             .ok_or(KsError::Rc(ResponseCode::VALUE_CORRUPTED))
             .context("In read_key_parameters: While reading elements buffer.")?;
 
         // update the stream position.
         *stream = &stream[element_size as usize..];
-
-        let mut element_stream = &elements_buffer[..];
 
         let mut params: Vec<KeyParameterValue> = Vec::new();
         for _ in 0..element_count {
