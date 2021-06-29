@@ -132,7 +132,12 @@ fn main() {
         },
     );
 
-    metrics::register_pull_metrics_callbacks();
+    std::thread::spawn(|| {
+        match metrics::register_pull_metrics_callbacks() {
+            Err(e) => error!("register_pull_metrics_callbacks failed: {:?}.", e),
+            _ => info!("Pull metrics callbacks successfully registered."),
+        };
+    });
 
     info!("Successfully registered Keystore 2.0 service.");
 

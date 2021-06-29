@@ -197,7 +197,7 @@ class SecureClock : public aidl::android::hardware::security::secureclock::BnSec
 class KeystoreCompatService : public BnKeystoreCompatService {
   private:
     std::unordered_map<KeyMintSecurityLevel, std::shared_ptr<IKeyMintDevice>> mDeviceCache;
-    std::unordered_map<KeyMintSecurityLevel, std::shared_ptr<ISharedSecret>> mSharedSecretCache;
+    std::shared_ptr<ISharedSecret> mSharedSecret;
     std::shared_ptr<ISecureClock> mSecureClock;
 
   public:

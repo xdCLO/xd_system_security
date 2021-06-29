@@ -241,13 +241,8 @@ impl KeystoreService {
             check_key_permission(KeyPerm::rebind(), &key, &None)
                 .context("Caller does not have permission to insert this certificate.")?;
 
-            db.store_new_certificate(
-                &key,
-                KeyType::Client,
-                certificate_chain.unwrap(),
-                &KEYSTORE_UUID,
-            )
-            .context("Failed to insert new certificate.")?;
+            db.store_new_certificate(&key, certificate_chain.unwrap(), &KEYSTORE_UUID)
+                .context("Failed to insert new certificate.")?;
             Ok(())
         })
         .context("In update_subcomponent.")
@@ -296,7 +291,7 @@ impl KeystoreService {
             &mut DB
                 .with(|db| {
                     let mut db = db.borrow_mut();
-                    db.list(k.domain, k.nspace, KeyType::Client)
+                    db.list(k.domain, k.nspace)
                 })
                 .context("In list_entries: Trying to list keystore database.")?,
         );

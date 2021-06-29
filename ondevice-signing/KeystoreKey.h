@@ -26,7 +26,6 @@
 
 #include <android/system/keystore2/IKeystoreService.h>
 
-#include "KeystoreHmacKey.h"
 #include "SigningKey.h"
 
 class KeystoreKey : public SigningKey {
@@ -45,13 +44,9 @@ class KeystoreKey : public SigningKey {
   private:
     KeystoreKey();
     bool initialize();
-    android::base::Result<std::vector<uint8_t>> verifyExistingKey();
-    android::base::Result<std::vector<uint8_t>> createKey();
-    android::base::Result<std::vector<uint8_t>> getOrCreateKey();
+    android::base::Result<KeyMetadata> createNewKey(const KeyDescriptor& descriptor);
 
-    KeyDescriptor mDescriptor;
-    KeystoreHmacKey mHmacKey;
     android::sp<IKeystoreService> mService;
     android::sp<IKeystoreSecurityLevel> mSecurityLevel;
-    std::vector<uint8_t> mPublicKey;
+    KeyMetadata mKeyMetadata;
 };

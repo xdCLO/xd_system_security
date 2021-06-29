@@ -32,6 +32,7 @@
 #include <odrefresh/odrefresh.h>
 
 #include "CertUtils.h"
+#include "KeymasterSigningKey.h"
 #include "KeystoreKey.h"
 #include "VerityUtils.h"
 
@@ -56,6 +57,7 @@ static const char* kOdrefreshPath = "/apex/com.android.art/bin/odrefresh";
 static const char* kFsVerityProcPath = "/proc/sys/fs/verity";
 
 static const bool kForceCompilation = false;
+static const bool kUseKeystore = true;
 
 static const char* kOdsignVerificationDoneProp = "odsign.verification.done";
 static const char* kOdsignKeyDoneProp = "odsign.key.done";
@@ -93,8 +95,10 @@ Result<void> createX509Cert(const SigningKey& key, const std::string& outPath) {
         return publicKey.error();
     }
 
-    auto keySignFunction = [&](const std::string& to_be_signed) { return key.sign(to_be_signed); };
-    createSelfSignedCertificate(*publicKey, keySignFunction, outPath);
+    auto keymasterSignFunction = [&](const std::string& to_be_signed) {
+        return key.sign(to_be_signed);
+    };
+    createSelfSignedCertificate(*publicKey, keymasterSignFunction, outPath);
     return {};
 }
 
@@ -298,12 +302,23 @@ int main(int /* argc */, char** /* argv */) {
         return 0;
     }
 
-    auto keystoreResult = KeystoreKey::getInstance();
-    if (!keystoreResult.ok()) {
-        LOG(ERROR) << "Could not create keystore key: " << keystoreResult.error().message();
-        return -1;
+    SigningKey* key;
+    if (kUseKeystore) {
+        auto keystoreResult = KeystoreKey::getInstance();
+        if (!keystoreResult.ok()) {
+            LOG(ERROR) << "Could not create keystore key: " << keystoreResult.error().message();
+            return -1;
+        }
+        key = keystoreResult.value();
+    } else {
+        // TODO - keymaster will go away
+        auto keymasterResult = KeymasterSigningKey::getInstance();
+        if (!keymasterResult.ok()) {
+            LOG(ERROR) << "Failed to create keymaster key: " << keymasterResult.error().message();
+            return -1;
+        }
+        key = keymasterResult.value();
     }
-    SigningKey* key = keystoreResult.value();
 
     bool supportsFsVerity = access(kFsVerityProcPath, F_OK) == 0;
     if (!supportsFsVerity) {
